@@ -1,0 +1,25 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Node / frontend
+web/node_modules
+web/.nuxt
+web/.output
+web/dist
+node_modules
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+
+# Local runtime state
+/data
+/test
+*.redb
+*.log
+
+# Session working files
+claude-goal.md

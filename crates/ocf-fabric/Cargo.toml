@@ -1,0 +1,23 @@
+[package]
+name = "ocf-fabric"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Host-to-host encrypted mesh: node identity, keypairs, transport, and membership."
+
+[dependencies]
+ocf-core.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+snow.workspace = true
+x25519-dalek.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

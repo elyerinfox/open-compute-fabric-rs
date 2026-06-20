@@ -1,0 +1,445 @@
+// Bundled mock fixtures so the UI renders fully without a live ocf-api backend.
+// useApi() falls back to these whenever a fetch fails (connection refused,
+// non-2xx, etc.). Keep these shapes in sync with ./types.ts.
+
+import type {
+  TopologyNode,
+  Workload,
+  Vpc,
+  Subnet,
+  LoadBalancer,
+  PhysicalDisk,
+  ResourceUsage,
+  User,
+  Role,
+  HealthReport,
+} from './types'
+
+const GiB = 1024 * 1024 * 1024
+
+export const mockHealth: HealthReport = {
+  status: 'ok',
+  version: '0.1.0-dev',
+}
+
+export const mockTopology: TopologyNode = {
+  id: 'fleet',
+  name: 'Open Compute Fabric',
+  level: 'Fleet',
+  health: 'Healthy',
+  children: [
+    {
+      id: 'region-us-east',
+      name: 'us-east',
+      level: 'Region',
+      health: 'Healthy',
+      children: [
+        {
+          id: 'dc-iad1',
+          name: 'iad1',
+          level: 'Datacenter',
+          health: 'Healthy',
+          children: [
+            {
+              id: 'rack-a01',
+              name: 'rack-a01',
+              level: 'Rack',
+              health: 'Healthy',
+              children: [
+                {
+                  id: 'm-iad1-a01-01',
+                  name: 'node-iad1-a01-01',
+                  level: 'Machine',
+                  health: 'Healthy',
+                  children: [],
+                  machine: {
+                    id: 'm-iad1-a01-01',
+                    hostname: 'node-iad1-a01-01',
+                    health: 'Healthy',
+                    state: 'Running',
+                    cpu_cores: 64,
+                    memory_bytes: 512 * GiB,
+                    disk_bytes: 8 * 1024 * GiB,
+                    ip_address: '10.10.1.11',
+                    rack: 'rack-a01',
+                    workload_count: 7,
+                    labels: { role: 'compute', gen: 'milan' },
+                  },
+                },
+                {
+                  id: 'm-iad1-a01-02',
+                  name: 'node-iad1-a01-02',
+                  level: 'Machine',
+                  health: 'Degraded',
+                  children: [],
+                  machine: {
+                    id: 'm-iad1-a01-02',
+                    hostname: 'node-iad1-a01-02',
+                    health: 'Degraded',
+                    state: 'Running',
+                    cpu_cores: 64,
+                    memory_bytes: 512 * GiB,
+                    disk_bytes: 8 * 1024 * GiB,
+                    ip_address: '10.10.1.12',
+                    rack: 'rack-a01',
+                    workload_count: 4,
+                    labels: { role: 'compute', gen: 'milan' },
+                  },
+                },
+              ],
+            },
+            {
+              id: 'rack-a02',
+              name: 'rack-a02',
+              level: 'Rack',
+              health: 'Healthy',
+              children: [
+                {
+                  id: 'm-iad1-a02-01',
+                  name: 'node-iad1-a02-01',
+                  level: 'Machine',
+                  health: 'Healthy',
+                  children: [],
+                  machine: {
+                    id: 'm-iad1-a02-01',
+                    hostname: 'node-iad1-a02-01',
+                    health: 'Healthy',
+                    state: 'Running',
+                    cpu_cores: 128,
+                    memory_bytes: 1024 * GiB,
+                    disk_bytes: 16 * 1024 * GiB,
+                    ip_address: '10.10.2.11',
+                    rack: 'rack-a02',
+                    workload_count: 12,
+                    labels: { role: 'gpu', gen: 'genoa' },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    {
+      id: 'region-eu-west',
+      name: 'eu-west',
+      level: 'Region',
+      health: 'Degraded',
+      children: [
+        {
+          id: 'dc-ams1',
+          name: 'ams1',
+          level: 'Datacenter',
+          health: 'Degraded',
+          children: [
+            {
+              id: 'rack-b01',
+              name: 'rack-b01',
+              level: 'Rack',
+              health: 'Degraded',
+              children: [
+                {
+                  id: 'm-ams1-b01-01',
+                  name: 'node-ams1-b01-01',
+                  level: 'Machine',
+                  health: 'Unhealthy',
+                  children: [],
+                  machine: {
+                    id: 'm-ams1-b01-01',
+                    hostname: 'node-ams1-b01-01',
+                    health: 'Unhealthy',
+                    state: 'Failed',
+                    cpu_cores: 64,
+                    memory_bytes: 256 * GiB,
+                    disk_bytes: 4 * 1024 * GiB,
+                    ip_address: '10.20.1.11',
+                    rack: 'rack-b01',
+                    workload_count: 0,
+                    labels: { role: 'compute', gen: 'rome' },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+}
+
+export const mockWorkloads: Workload[] = [
+  {
+    metadata: { id: 'wl-001', name: 'edge-api', labels: { app: 'edge', tier: 'frontend' } },
+    kind: 'Container',
+    image: 'registry.ocf/edge-api:1.4.2',
+    resources: { cpu_millis: 2000, memory_bytes: 2 * GiB, disk_bytes: 10 * GiB },
+    state: 'Running',
+    node: 'm-iad1-a01-01',
+    node_name: 'node-iad1-a01-01',
+    highly_available: true,
+    placement: 'region/us-east',
+    env: { LOG_LEVEL: 'info' },
+  },
+  {
+    metadata: { id: 'wl-002', name: 'postgres-primary', labels: { app: 'db' } },
+    kind: 'VirtualMachine',
+    image: 'images.ocf/postgres-16:latest',
+    resources: { cpu_millis: 8000, memory_bytes: 32 * GiB, disk_bytes: 512 * GiB },
+    state: 'Running',
+    node: 'm-iad1-a02-01',
+    node_name: 'node-iad1-a02-01',
+    highly_available: true,
+    placement: 'datacenter/iad1',
+  },
+  {
+    metadata: { id: 'wl-003', name: 'batch-render', labels: { app: 'render' } },
+    kind: 'Container',
+    image: 'registry.ocf/render:9.0',
+    resources: { cpu_millis: 16000, memory_bytes: 64 * GiB, disk_bytes: 20 * GiB },
+    state: 'Pending',
+    node: null,
+    node_name: null,
+    highly_available: false,
+  },
+  {
+    metadata: { id: 'wl-004', name: 'cache-redis', labels: { app: 'cache' } },
+    kind: 'Container',
+    image: 'registry.ocf/redis:7.4',
+    resources: { cpu_millis: 1000, memory_bytes: 8 * GiB, disk_bytes: 2 * GiB },
+    state: 'Running',
+    node: 'm-iad1-a01-02',
+    node_name: 'node-iad1-a01-02',
+    highly_available: false,
+  },
+  {
+    metadata: { id: 'wl-005', name: 'win-buildhost', labels: { app: 'ci' } },
+    kind: 'VirtualMachine',
+    image: 'images.ocf/windows-server-2022:latest',
+    resources: { cpu_millis: 4000, memory_bytes: 16 * GiB, disk_bytes: 256 * GiB },
+    state: 'Stopped',
+    node: 'm-iad1-a01-01',
+    node_name: 'node-iad1-a01-01',
+    highly_available: false,
+  },
+  {
+    metadata: { id: 'wl-006', name: 'failed-worker', labels: { app: 'queue' } },
+    kind: 'Container',
+    image: 'registry.ocf/worker:2.1',
+    resources: { cpu_millis: 2000, memory_bytes: 4 * GiB, disk_bytes: 5 * GiB },
+    state: 'Failed',
+    node: 'm-ams1-b01-01',
+    node_name: 'node-ams1-b01-01',
+    highly_available: true,
+    placement: 'region/eu-west',
+  },
+]
+
+export const mockVpcs: Vpc[] = [
+  {
+    metadata: { id: 'vpc-001', name: 'prod', labels: { env: 'production' } },
+    cidr: '10.0.0.0/8',
+    vni: 4096,
+    subnet_count: 3,
+  },
+  {
+    metadata: { id: 'vpc-002', name: 'staging', labels: { env: 'staging' } },
+    cidr: '172.16.0.0/12',
+    vni: 4097,
+    subnet_count: 2,
+  },
+  {
+    metadata: { id: 'vpc-003', name: 'mgmt', labels: { env: 'management' } },
+    cidr: '192.168.0.0/16',
+    vni: 4098,
+    subnet_count: 1,
+  },
+]
+
+export const mockSubnets: Subnet[] = [
+  {
+    metadata: { id: 'sn-001', name: 'prod-frontend' },
+    vpc_id: 'vpc-001',
+    vpc_name: 'prod',
+    cidr: '10.1.0.0/16',
+    netns: 'ns-prod-fe',
+  },
+  {
+    metadata: { id: 'sn-002', name: 'prod-backend' },
+    vpc_id: 'vpc-001',
+    vpc_name: 'prod',
+    cidr: '10.2.0.0/16',
+    netns: 'ns-prod-be',
+  },
+  {
+    metadata: { id: 'sn-003', name: 'prod-data' },
+    vpc_id: 'vpc-001',
+    vpc_name: 'prod',
+    cidr: '10.3.0.0/16',
+    netns: 'ns-prod-data',
+  },
+  {
+    metadata: { id: 'sn-004', name: 'staging-app' },
+    vpc_id: 'vpc-002',
+    vpc_name: 'staging',
+    cidr: '172.16.1.0/24',
+    netns: 'ns-stg-app',
+  },
+  {
+    metadata: { id: 'sn-005', name: 'staging-db' },
+    vpc_id: 'vpc-002',
+    vpc_name: 'staging',
+    cidr: '172.16.2.0/24',
+    netns: 'ns-stg-db',
+  },
+  {
+    metadata: { id: 'sn-006', name: 'mgmt-ipmi' },
+    vpc_id: 'vpc-003',
+    vpc_name: 'mgmt',
+    cidr: '192.168.10.0/24',
+    netns: 'ns-mgmt-ipmi',
+  },
+]
+
+export const mockLoadBalancers: LoadBalancer[] = [
+  {
+    metadata: { id: 'lb-001', name: 'edge-https', labels: { app: 'edge' } },
+    kind: 'Application',
+    listeners: [
+      { port: 80, tls: false },
+      { port: 443, tls: true },
+    ],
+    target_selector: { app: 'edge' },
+    policy: 'Latency',
+    placement: 'region/us-east',
+    anycast: true,
+    hostnames: ['api.ocf.example', 'www.ocf.example'],
+    backend_count: 4,
+    health: 'Healthy',
+  },
+  {
+    metadata: { id: 'lb-002', name: 'postgres-tcp', labels: { app: 'db' } },
+    kind: 'Tcp',
+    listeners: [{ port: 5432, tls: false }],
+    target_selector: { app: 'db' },
+    policy: 'LeastLoad',
+    placement: 'datacenter/iad1',
+    anycast: false,
+    hostnames: [],
+    backend_count: 2,
+    health: 'Healthy',
+  },
+  {
+    metadata: { id: 'lb-003', name: 'global-geo', labels: { app: 'edge' } },
+    kind: 'Application',
+    listeners: [{ port: 443, tls: true }],
+    target_selector: { app: 'edge' },
+    policy: 'Geo',
+    placement: null,
+    anycast: true,
+    hostnames: ['geo.ocf.example'],
+    backend_count: 6,
+    health: 'Degraded',
+  },
+]
+
+export const mockDisks: PhysicalDisk[] = [
+  {
+    metadata: { id: 'disk-001', name: 'sda' },
+    machine_id: 'm-iad1-a01-01',
+    machine_name: 'node-iad1-a01-01',
+    dev_path: '/dev/sda',
+    serial: 'S5GXNX0R123456',
+    wwn: '0x5002538e40a1b2c3',
+    model: 'Samsung PM9A3',
+    vendor: 'Samsung',
+    size_bytes: 4 * 1024 * GiB,
+    health: 'Ok',
+    first_seen: '2024-01-15T08:30:00Z',
+    rma_date: null,
+    enclosure: 'enc-0',
+    slot: 0,
+    led: 'Normal',
+  },
+  {
+    metadata: { id: 'disk-002', name: 'sdb' },
+    machine_id: 'm-iad1-a01-01',
+    machine_name: 'node-iad1-a01-01',
+    dev_path: '/dev/sdb',
+    serial: 'S5GXNX0R654321',
+    wwn: '0x5002538e40a1b2c4',
+    model: 'Samsung PM9A3',
+    vendor: 'Samsung',
+    size_bytes: 4 * 1024 * GiB,
+    health: 'Warning',
+    first_seen: '2024-01-15T08:30:00Z',
+    rma_date: null,
+    enclosure: 'enc-0',
+    slot: 1,
+    led: 'Locate',
+  },
+  {
+    metadata: { id: 'disk-003', name: 'nvme0n1' },
+    machine_id: 'm-ams1-b01-01',
+    machine_name: 'node-ams1-b01-01',
+    dev_path: '/dev/nvme0n1',
+    serial: 'BTLJ9123456789',
+    wwn: '0x5002538e40a1b2d1',
+    model: 'Intel P5520',
+    vendor: 'Intel',
+    size_bytes: 8 * 1024 * GiB,
+    health: 'Failing',
+    first_seen: '2023-06-01T12:00:00Z',
+    rma_date: '2026-06-10T00:00:00Z',
+    enclosure: 'enc-1',
+    slot: 3,
+    led: 'Fault',
+  },
+]
+
+export const mockHostMetrics: ResourceUsage = {
+  cpu_pct: 37.4,
+  memory_used: 198 * GiB,
+  memory_total: 512 * GiB,
+  disk_used: 3200 * GiB,
+  disk_total: 8192 * GiB,
+  net_rx_bps: 1_250_000_000,
+  net_tx_bps: 840_000_000,
+  read_iops: 12_400,
+  write_iops: 8_900,
+}
+
+export const mockUsers: User[] = [
+  {
+    metadata: { id: 'u-001', name: 'Ada Lovelace' },
+    username: 'ada',
+    groups: ['administrators', 'sre'],
+    email: 'ada@ocf.example',
+  },
+  {
+    metadata: { id: 'u-002', name: 'Grace Hopper' },
+    username: 'grace',
+    groups: ['sre'],
+    email: 'grace@ocf.example',
+  },
+  {
+    metadata: { id: 'u-003', name: 'Auditor Bot' },
+    username: 'auditor',
+    groups: ['auditors'],
+    email: 'audit@ocf.example',
+  },
+]
+
+export const mockRoles: Role[] = [
+  {
+    metadata: { id: 'r-001', name: 'Administrator' },
+    permissions: ['*'],
+  },
+  {
+    metadata: { id: 'r-002', name: 'Auditor' },
+    permissions: ['audit:read', 'workload:read', 'topology:read'],
+  },
+  {
+    metadata: { id: 'r-003', name: 'Operator' },
+    permissions: ['workload:create', 'workload:migrate', 'lb:manage', 'vpc:manage'],
+  },
+]

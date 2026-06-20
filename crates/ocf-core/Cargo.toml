@@ -1,0 +1,15 @@
+[package]
+name = "ocf-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core contracts, plugin registry, and shared domain types for Open Compute Fabric."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true

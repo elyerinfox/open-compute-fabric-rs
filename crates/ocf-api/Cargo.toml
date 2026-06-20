@@ -1,0 +1,32 @@
+[package]
+name = "ocf-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "axum REST API exposing the Open Compute Fabric controller, and static frontend hosting."
+
+[dependencies]
+ocf-core.workspace = true
+ocf-topology.workspace = true
+ocf-runtime.workspace = true
+ocf-auth.workspace = true
+ocf-authz.workspace = true
+ocf-kernel.workspace = true
+ocf-inventory.workspace = true
+ocf-disk.workspace = true
+ocf-monitoring.workspace = true
+ocf-fabric.workspace = true
+ocf-network.workspace = true
+ocf-loadbalancer.workspace = true
+ocf-store.workspace = true
+ocf-consensus.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+chrono.workspace = true

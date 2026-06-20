@@ -1,0 +1,19 @@
+[package]
+name = "ocf-loadbalancer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Load balancing (TCP/ALB), TLS certificate issuance, and dynamic DNS for the fabric."
+
+[dependencies]
+ocf-core.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

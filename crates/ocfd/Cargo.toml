@@ -1,0 +1,21 @@
+[package]
+name = "ocfd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The Open Compute Fabric monolithic daemon: one binary that configures and serves the whole control plane."
+
+[[bin]]
+name = "ocfd"
+path = "src/main.rs"
+
+[dependencies]
+ocf-core.workspace = true
+ocf-api.workspace = true
+
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "ocf-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Internal SDN overlay: VPC, subnet, route, and ACL/firewall policy across the fleet."
+
+[dependencies]
+ocf-core.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

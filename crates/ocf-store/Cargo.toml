@@ -1,0 +1,15 @@
+[package]
+name = "ocf-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Durable, pluggable key/value state store for the fabric control plane (redb-backed) with an in-memory fallback."
+
+[dependencies]
+ocf-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+redb.workspace = true

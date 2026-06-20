@@ -1,0 +1,21 @@
+[package]
+name = "ocf-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Run containers & VMs, migrate live workloads, and autoscale."
+
+[dependencies]
+ocf-core.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+# Real backends drive host tooling via `tokio::process::Command`; the workspace
+# tokio enables the "full" feature set, which includes `process`.
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

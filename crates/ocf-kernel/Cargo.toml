@@ -1,0 +1,18 @@
+[package]
+name = "ocf-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Host kernel control: IP forwarding & bridges, firewall backends, and service supervision."
+
+[dependencies]
+ocf-core.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+# Real host operations shell out via `tokio::process::Command`; the workspace
+# already pins tokio (used as a dev-dependency for the `#[tokio::test]` harness),
+# so this only promotes it to a build dependency rather than adding a new crate.
+tokio.workspace = true

@@ -1,0 +1,44 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply antialiased;
+  }
+
+  body {
+    @apply bg-surface-950 text-slate-200;
+  }
+
+  /* Thin, subtle scrollbars that match the dark surfaces. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-surface-900;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-surface-700 rounded-full border-2 border-solid border-surface-900;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-surface-600;
+  }
+}
+
+@layer components {
+  /* Card surface reused across the dashboard. */
+  .ocf-card {
+    @apply rounded-xl border border-surface-700 bg-surface-900/70 shadow-sm;
+  }
+
+  .ocf-nav-link {
+    @apply flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-slate-400
+           transition-colors hover:bg-surface-800 hover:text-slate-100;
+  }
+
+  .ocf-nav-link-active {
+    @apply bg-brand-600/15 text-brand-400 hover:bg-brand-600/20 hover:text-brand-400;
+  }
+}

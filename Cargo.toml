@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ocf-core",
+    "crates/ocf-topology",
+    "crates/ocf-auth",
+    "crates/ocf-authz",
+    "crates/ocf-inventory",
+    "crates/ocf-network",
+    "crates/ocf-fabric",
+    "crates/ocf-kernel",
+    "crates/ocf-runtime",
+    "crates/ocf-disk",
+    "crates/ocf-monitoring",
+    "crates/ocf-loadbalancer",
+    "crates/ocf-store",
+    "crates/ocf-consensus",
+    "crates/ocf-api",
+    "crates/ocfd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Open Compute Fabric contributors"]
+repository = "https://github.com/elycin/open-compute-fabric-rs"
+
+[workspace.dependencies]
+# Internal crates
+ocf-core = { path = "crates/ocf-core" }
+ocf-runtime = { path = "crates/ocf-runtime" }
+ocf-auth = { path = "crates/ocf-auth" }
+ocf-authz = { path = "crates/ocf-authz" }
+ocf-kernel = { path = "crates/ocf-kernel" }
+ocf-inventory = { path = "crates/ocf-inventory" }
+ocf-disk = { path = "crates/ocf-disk" }
+ocf-monitoring = { path = "crates/ocf-monitoring" }
+ocf-topology = { path = "crates/ocf-topology" }
+ocf-fabric = { path = "crates/ocf-fabric" }
+ocf-network = { path = "crates/ocf-network" }
+ocf-loadbalancer = { path = "crates/ocf-loadbalancer" }
+ocf-api = { path = "crates/ocf-api" }
+ocf-store = { path = "crates/ocf-store" }
+ocf-consensus = { path = "crates/ocf-consensus" }
+
+# Third-party
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+parking_lot = "0.12"
+anyhow = "1"
+redb = "2"
+snow = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+hex = "0.4"
+futures = "0.3"
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+
+[profile.release]
+opt-level = 2
