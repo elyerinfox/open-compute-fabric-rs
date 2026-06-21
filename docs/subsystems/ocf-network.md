@@ -494,6 +494,28 @@ three planes.
 | `attach_workload_veth(netns, bridge, id, addr)` | a veth pair: one end into the workload netns (addressed), the other onto the subnet bridge — splices a workload onto the overlay |
 | `attach_container_to_subnet(pid, alias, bridge, id, addr)` | exposes a **running container's** netns (via its host PID → `ip netns attach`) then `attach_workload_veth` — the last mile for live containers |
 
+### Kernel datapath, userspace fallback
+
+`ensure_interface` is **kernel-first with a userspace fallback**, returning the
+`WireguardMode` it realized:
+
+1. Best-effort `modprobe wireguard`, then `ip link add <iface> type wireguard` —
+   the in-kernel datapath (mainline Linux ≥ 5.6), fastest and always preferred →
+   `WireguardMode::Kernel`.
+2. If the kernel module is unavailable (older kernel, locked-down or non-Linux
+   host), bring up a **userspace** interface with the first available backend on
+   `PATH` — `boringtun` (Cloudflare's **pure-Rust** implementation; preferred),
+   `boringtun-cli`, or `wireguard-go`. Each, run as `<bin> <iface>`, creates an
+   interface named `<iface>` that the *same* `wg`/`ip` commands then drive →
+   `WireguardMode::Userspace("boringtun")`.
+3. If neither a kernel module nor a userspace backend exists, an **honest error**
+   names exactly what to install — the rest of the fabric keeps running.
+
+So the underlay comes up across the widest range of hosts at kernel speed where
+possible, and the realized mode is logged per plane. (A fully self-contained
+in-process datapath — the `boringtun` crate over a TUN device, no `wg`/`ip`/kernel
+module at all — is the documented next step, reusing the same X25519 identity.)
+
 A node's **WireGuard identity is its fabric identity**: the `ocf-fabric` X25519
 keypair *is* a Curve25519 WireGuard key (`PublicKey::to_wireguard_key()` /
 `SecretKey::to_wireguard_key()` base64-encode it), used on every plane. The peer

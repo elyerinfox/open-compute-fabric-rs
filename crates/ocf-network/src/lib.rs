@@ -30,7 +30,8 @@ pub use backend::{register_builtins, LinuxNetnsBackend, NetworkBackend, OvsBacke
 pub use controller::NetworkController;
 pub use ipam::SubnetAllocator;
 pub use wireguard::{
-    attach_container_to_subnet, attach_workload_veth, subnet_bridge_name, WireguardUnderlay,
+    attach_container_to_subnet, attach_workload_veth, subnet_bridge_name, WireguardMode,
+    WireguardUnderlay,
 };
 pub use model::{
     AclAction, AclDirection, AclRule, AclScope, EgressMode, FirewallPolicy, Route, Subnet, Vpc,

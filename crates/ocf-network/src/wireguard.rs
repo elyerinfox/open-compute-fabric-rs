@@ -22,7 +22,61 @@
 use crate::backend::run;
 use ocf_core::prelude::*;
 
-/// Programs this host's WireGuard interface and its peers via `ip` + `wg`.
+/// How a WireGuard interface is realized on this host.
+///
+/// The kernel datapath (`wireguard` module, mainline since Linux 5.6) is fastest
+/// and always preferred; a **userspace** implementation is the fallback for older
+/// kernels, locked-down hosts, or platforms without the module. Either way the
+/// interface is driven identically through `wg` + `ip`, so only its creation
+/// differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireguardMode {
+    /// The in-kernel `wireguard` module.
+    Kernel,
+    /// A userspace implementation, by binary name.
+    Userspace(&'static str),
+}
+
+impl std::fmt::Display for WireguardMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireguardMode::Kernel => write!(f, "kernel"),
+            WireguardMode::Userspace(bin) => write!(f, "userspace:{bin}"),
+        }
+    }
+}
+
+/// Userspace WireGuard backends we know how to start, in preference order.
+/// `boringtun` is Cloudflare's pure-Rust implementation; `wireguard-go` is the Go
+/// reference. Each, invoked as `<bin> <iface>`, creates a userspace interface
+/// named `<iface>` that `wg`/`ip` then drive exactly like a kernel one.
+const USERSPACE_BACKENDS: &[&str] = &["boringtun", "boringtun-cli", "wireguard-go"];
+
+/// Whether `bin` is on `PATH` — a side-effect-free check (no spawning), so we
+/// never accidentally invoke an unknown binary while probing.
+fn binary_available(bin: &str) -> bool {
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    for dir in path.split(sep).filter(|d| !d.is_empty()) {
+        let candidate = std::path::Path::new(dir).join(bin);
+        if candidate.is_file() {
+            return true;
+        }
+        if cfg!(windows) {
+            for ext in ["exe", "cmd", "bat"] {
+                if candidate.with_extension(ext).is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Programs this host's WireGuard interface and its peers via `ip` + `wg`,
+/// preferring the kernel datapath and falling back to userspace.
 #[derive(Debug, Clone)]
 pub struct WireguardUnderlay {
     iface: String,
@@ -43,16 +97,55 @@ impl WireguardUnderlay {
         &self.iface
     }
 
-    /// Create and configure this node's WireGuard interface: set its private key
-    /// (this node's fabric secret key, base64) and listen port, assign its
-    /// `address_cidr` (e.g. `"10.255.0.1/16"`), and bring it up. Idempotent.
+    /// Create the interface, **preferring the kernel datapath and falling back to
+    /// a userspace implementation** when the `wireguard` kernel module is absent.
+    /// Returns the [`WireguardMode`] actually used. Honest error when neither a
+    /// kernel module nor a userspace backend is available.
+    async fn create_interface(&self) -> Result<WireguardMode> {
+        // Best-effort: load the module if it exists but isn't loaded yet (needs
+        // root; absent `modprobe` just fails harmlessly).
+        let _ = run("modprobe", &["wireguard"]).await;
+
+        // 1. Kernel datapath. `run` treats "File exists" as success, so an
+        //    interface created on a previous run is fine.
+        if run("ip", &["link", "add", &self.iface, "type", "wireguard"])
+            .await
+            .is_ok()
+        {
+            return Ok(WireguardMode::Kernel);
+        }
+
+        // 2. Userspace fallback: the backend creates an interface named `<iface>`,
+        //    after which `wg`/`ip` drive it identically.
+        for bin in USERSPACE_BACKENDS {
+            if binary_available(bin) {
+                run(bin, &[&self.iface]).await?;
+                tracing::info!(iface = %self.iface, backend = bin, "created userspace WireGuard interface");
+                return Ok(WireguardMode::Userspace(bin));
+            }
+        }
+
+        Err(Error::provider(
+            "wireguard",
+            format!(
+                "interface `{}`: no kernel `wireguard` module and no userspace backend on PATH \
+                 (install the wireguard kernel module, or `boringtun` / `wireguard-go`)",
+                self.iface
+            ),
+        ))
+    }
+
+    /// Create and configure this node's WireGuard interface: bring it up (kernel
+    /// or userspace — see [`create_interface`](Self::create_interface)), set its
+    /// private key (this node's fabric secret key, base64) and listen port, assign
+    /// its `address_cidr` (e.g. `"10.255.0.1/16"`), and raise it. Returns the
+    /// realized [`WireguardMode`]. Idempotent.
     pub async fn ensure_interface(
         &self,
         private_key_b64: &str,
         address_cidr: &str,
-    ) -> Result<()> {
-        // `ip link add <iface> type wireguard` — "File exists" treated as success.
-        run("ip", &["link", "add", &self.iface, "type", "wireguard"]).await?;
+    ) -> Result<WireguardMode> {
+        let mode = self.create_interface().await?;
 
         // `wg set` reads the private key from a file (not argv, to keep it off the
         // process table). Write it, apply, then remove.
@@ -72,8 +165,8 @@ impl WireguardUnderlay {
         // Address + up.
         run("ip", &["addr", "add", address_cidr, "dev", &self.iface]).await?;
         run("ip", &["link", "set", &self.iface, "up"]).await?;
-        tracing::info!(iface = %self.iface, address = %address_cidr, "WireGuard underlay up");
-        Ok(())
+        tracing::info!(iface = %self.iface, address = %address_cidr, mode = %mode, "WireGuard underlay up");
+        Ok(mode)
     }
 
     /// Add (or update) a peer: its WireGuard public key, real underlay endpoint
@@ -218,5 +311,26 @@ mod tests {
     fn iface_accessor() {
         let wg = WireguardUnderlay::new("wg-ocf", 51820);
         assert_eq!(wg.iface(), "wg-ocf");
+    }
+
+    #[test]
+    fn mode_renders_kernel_and_userspace() {
+        assert_eq!(WireguardMode::Kernel.to_string(), "kernel");
+        assert_eq!(
+            WireguardMode::Userspace("boringtun").to_string(),
+            "userspace:boringtun"
+        );
+    }
+
+    #[test]
+    fn boringtun_is_the_preferred_userspace_backend() {
+        // Pure Rust first, Go reference last.
+        assert_eq!(USERSPACE_BACKENDS.first(), Some(&"boringtun"));
+        assert!(USERSPACE_BACKENDS.contains(&"wireguard-go"));
+    }
+
+    #[test]
+    fn binary_available_is_false_for_a_nonexistent_binary() {
+        assert!(!binary_available("ocf-definitely-not-a-real-binary-xyz-123"));
     }
 }

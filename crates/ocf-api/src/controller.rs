@@ -430,11 +430,12 @@ impl FabricController {
             .self_index(plan)
             .map(|i| plane.ip(i))
             .unwrap_or_else(|| format!("{}.254", plane.prefix));
-        if let Err(e) = wg
+        match wg
             .ensure_interface(&my_kp.secret.to_wireguard_key(), &format!("{my_ip}/16"))
             .await
         {
-            tracing::warn!(plane = plane.iface, error = %e, "wireguard interface setup failed");
+            Ok(mode) => tracing::info!(plane = plane.iface, %mode, "wireguard plane up"),
+            Err(e) => tracing::warn!(plane = plane.iface, error = %e, "wireguard interface setup failed"),
         }
         for (_, name, index, addr) in plan {
             if name == &self.node_id {
