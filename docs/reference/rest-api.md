@@ -38,6 +38,7 @@ handler is a thin adapter that borrows one subsystem off the
 | `GET` | `/api/v1/networks/subnets` | Network | Every subnet across every VPC |
 | `POST` | `/api/v1/networks/subnets/:id/egress` | Network | Set a subnet's outbound-internet (NAT) capability |
 | `GET` | `/api/v1/loadbalancers` | LoadBalancer | Every load balancer |
+| `GET` | `/api/v1/loadbalancers/:id/backends` | LoadBalancer | Live backend set resolved from the LB's `target_selector` (on the wg-lb plane) |
 | `GET` | `/api/v1/disks` | Storage | Every physical disk across the fleet |
 | `GET` | `/api/v1/metrics/host` | Monitoring | Aggregate host resource usage |
 | `GET` | `/api/v1/fabric/peers` | Fabric/Membership | Mesh peer records |
@@ -634,7 +635,7 @@ flag; `placement` is an optional [`Scope`](../architecture/scopes-and-placement.
     },
     "kind": "application",
     "listeners": [ { "port": 443, "tls": true } ],
-    "target_selector": {},
+    "target_selector": { "app": "web" },
     "policy": "latency",
     "placement": null,
     "anycast": false,
@@ -657,6 +658,26 @@ flag; `placement` is an optional [`Scope`](../architecture/scopes-and-placement.
     "anycast": false,
     "hostnames": []
   }
+]
+```
+
+The `target_selector` is the label set this LB fronts — the same set an autoscaler
+governs, so an LB and its autoscaling group are associated by sharing it.
+
+### `GET /api/v1/loadbalancers/:id/backends`
+
+The LB's **live backend set**, resolved from its `target_selector`: the scheduled
+workloads whose labels match, each addressed at its hosting node's **wg-lb** plane
+address, with measured RTT stamped (for the `Latency` policy). The set follows the
+autoscaling group as it scales.
+
+**Response**
+
+```json
+[
+  { "workload_id": "web-1", "address": "10.253.0.3:0",
+    "scope": { "level": "machine", "id": "node-3" },
+    "load": 0.0, "latency_ms": 0.42, "geo": null }
 ]
 ```
 
@@ -845,29 +866,32 @@ The machines a workload can be (re)scheduled onto, given its `node_selector`
 
 ### `GET /api/v1/fabric/wireguard`
 
-The computed **WireGuard underlay mesh**: this node and its peers, with their
-WireGuard public keys (base64 Curve25519, derived from each node's fabric
-identity) and underlay endpoints. The VXLAN overlay's VTEPs point at these
-WireGuard addresses, so cross-host workload traffic is encrypted; tenant
-isolation stays in the VXLAN VNIs / ACLs (see
-[ocf-network → WireGuard underlay](../subsystems/ocf-network.md#wireguard-underlay--encrypting-the-overlay)).
+The computed **WireGuard underlay planes**: this node and its peers on each of
+the three isolated planes — `wg-mgmt` (control), `wg-data` (workload VXLAN), and
+`wg-lb` (load balancer). Each peer entry carries its WireGuard public key (base64
+Curve25519, derived from the node's fabric identity), its overlay address on that
+plane, and its real underlay `endpoint`. Tenant isolation stays in the VXLAN
+VNIs / ACLs over `wg-data` (see
+[ocf-network → WireGuard underlays](../subsystems/ocf-network.md#wireguard-underlays--three-isolated-encrypted-planes)).
 
 **Response**
 
 ```json
 {
-  "iface": "wg-ocf",
   "node": "node-1",
-  "node_ip": "10.255.0.1",
   "public_key": "0SqA+ka2sZVRFmhvkj0Zb9sPAg3k5G6YKkdKeV1UAjE=",
-  "vxlan_rides_wireguard": true,
-  "peers": [
+  "planes": [
     {
-      "name": "node-2",
-      "wg_ip": "10.255.0.2",
-      "endpoint": "10.0.0.2:51820",
-      "public_key": "nOjMzMr58+b6g8QE9Qj82w4IaoEmW5QAGI8CiRUHbF0="
-    }
+      "iface": "wg-mgmt", "purpose": "control",
+      "node_ip": "10.255.0.1", "port": 51820,
+      "peers": [
+        { "name": "node-2", "wg_ip": "10.255.0.2",
+          "endpoint": "10.0.0.2:51820",
+          "public_key": "nOjMzMr58+b6g8QE9Qj82w4IaoEmW5QAGI8CiRUHbF0=" }
+      ]
+    },
+    { "iface": "wg-data", "purpose": "workload", "node_ip": "10.254.0.1", "port": 51821, "peers": [] },
+    { "iface": "wg-lb", "purpose": "load-balancer", "node_ip": "10.253.0.1", "port": 51822, "peers": [] }
   ]
 }
 ```

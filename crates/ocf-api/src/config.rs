@@ -17,7 +17,9 @@ pub struct ControllerConfig {
     pub suspect_timeout_secs: i64,
     /// Additional seconds after suspicion before a peer is declared dead.
     pub dead_timeout_secs: i64,
-    /// Port for the fabric control channel (ping/latency probing) on each node.
+    /// TCP port for the fabric control channel (RPC, ping/latency probing),
+    /// reached over the `wg-mgmt` overlay. Distinct from the WireGuard UDP ports
+    /// (51820/51821/51822).
     pub fabric_control_port: u16,
 }
 
@@ -29,7 +31,7 @@ impl Default for ControllerConfig {
             seeds: Vec::new(),
             suspect_timeout_secs: 5,
             dead_timeout_secs: 5,
-            fabric_control_port: 51821,
+            fabric_control_port: 51900,
         }
     }
 }

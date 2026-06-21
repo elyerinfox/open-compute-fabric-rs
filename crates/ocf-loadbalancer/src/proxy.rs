@@ -109,7 +109,6 @@ async fn proxy_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocf_core::prelude::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A self-contained echo server: accepts one connection, reads `expect`

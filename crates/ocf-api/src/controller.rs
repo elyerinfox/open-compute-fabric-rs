@@ -40,8 +40,30 @@ use ocf_topology::{Datacenter, InMemoryTopology, Machine, Rack, Region, Topology
 
 use crate::config::ControllerConfig;
 
-/// UDP port the WireGuard underlay listens on across the fleet.
-const WG_PORT: u16 = 51820;
+/// One isolated WireGuard underlay plane: its interface name, the `/24` host
+/// prefix it assigns overlay addresses from, and its WireGuard (UDP) listen port.
+/// The fabric runs three of these so the management, workload, and load-balancer
+/// data planes never share an interface or address space.
+#[derive(Clone, Copy)]
+pub(crate) struct WgPlane {
+    pub iface: &'static str,
+    pub prefix: &'static str,
+    pub port: u16,
+}
+
+/// Control plane (Raft, membership, latency, streaming) — node-to-node management.
+pub(crate) const WG_MGMT: WgPlane = WgPlane { iface: "wg-mgmt", prefix: "10.255.0", port: 51820 };
+/// Workload data plane — the VXLAN overlay's VTEPs ride this.
+pub(crate) const WG_DATA: WgPlane = WgPlane { iface: "wg-data", prefix: "10.254.0", port: 51821 };
+/// Load-balancer ingress plane — LB-to-backend traffic rides this.
+pub(crate) const WG_LB: WgPlane = WgPlane { iface: "wg-lb", prefix: "10.253.0", port: 51822 };
+
+impl WgPlane {
+    /// This plane's overlay address for the machine at `index` (1-based host).
+    pub(crate) fn ip(&self, index: usize) -> String {
+        format!("{}.{}", self.prefix, index + 1)
+    }
+}
 
 /// Every subsystem of the fabric, owned in one place.
 pub struct FabricController {
@@ -65,8 +87,6 @@ pub struct FabricController {
     pub monitoring: MonitoringService,
     pub fabric: FabricMesh,
     pub network: NetworkController,
-    /// The encrypted WireGuard underlay the VXLAN overlay rides on.
-    pub wireguard: WireguardUnderlay,
     pub loadbalancers: LoadBalancerController,
     pub cert_providers: Registry<dyn CertificateProvider>,
     pub dns_providers: Registry<dyn DnsProvider>,
@@ -135,7 +155,6 @@ impl FabricController {
         let mut net_backends = Registry::<dyn NetworkBackend>::new();
         ocf_network::register_builtins(&mut net_backends)?;
         let network = NetworkController::new(Arc::new(net_backends));
-        let wireguard = WireguardUnderlay::new("wg-ocf", WG_PORT);
 
         let mut cert_providers = Registry::<dyn CertificateProvider>::new();
         let mut dns_providers = Registry::<dyn DnsProvider>::new();
@@ -192,7 +211,6 @@ impl FabricController {
             monitoring,
             fabric,
             network,
-            wireguard,
             loadbalancers,
             cert_providers,
             dns_providers,
@@ -377,11 +395,11 @@ impl FabricController {
         Ok(())
     }
 
-    /// Assign each machine a deterministic WireGuard underlay address
-    /// (`10.255.0.{i+1}/16`, machines sorted by name), returning
-    /// `(machine_id, name, wg_ip, underlay_endpoint)` per machine. The endpoint is
-    /// the machine's real `fabric_address` plus the WireGuard listen port.
-    pub(crate) async fn wireguard_plan(&self) -> Vec<(Id, String, String, Option<String>)> {
+    /// The deterministic per-machine plan: `(machine_id, name, index,
+    /// fabric_address)` with machines sorted by name. The `index` indexes every
+    /// plane's address (`WgPlane::ip`), and `fabric_address` is the real underlay
+    /// address a WireGuard `endpoint` points at.
+    pub(crate) async fn machine_plan(&self) -> Vec<(Id, String, usize, Option<String>)> {
         let mut machines = match self.topology.store().all_machines().await {
             Ok(m) => m,
             Err(_) => return Vec::new(),
@@ -390,72 +408,81 @@ impl FabricController {
         machines
             .into_iter()
             .enumerate()
-            .map(|(i, m)| {
-                let wg_ip = format!("10.255.0.{}", i + 1);
-                let endpoint = m
-                    .fabric_address
-                    .as_ref()
-                    .map(|a| format!("{a}:{WG_PORT}"));
-                (m.metadata.id.clone(), m.metadata.name, wg_ip, endpoint)
-            })
+            .map(|(i, m)| (m.metadata.id.clone(), m.metadata.name, i, m.fabric_address))
             .collect()
     }
 
-    /// Bring up this node's WireGuard underlay interface (using its fabric
-    /// identity as the WireGuard key) and program every *other* node as a peer.
-    /// This is the encrypted, kernel-datapath underlay the VXLAN overlay rides.
-    /// Best-effort: a host without `wg`/`ip` logs and is skipped.
-    pub async fn program_wireguard(&self) {
-        let plan = self.wireguard_plan().await;
-        if plan.is_empty() {
-            return;
-        }
-        // This node's WireGuard identity == its fabric identity.
-        let my_kp = KeyPair::from_seed_name(&self.node_id);
-        let my_ip = plan
-            .iter()
+    /// This node's index in the plan (for address assignment), if present.
+    fn self_index(&self, plan: &[(Id, String, usize, Option<String>)]) -> Option<usize> {
+        plan.iter()
             .find(|(_, name, _, _)| name == &self.node_id)
-            .map(|(_, _, ip, _)| ip.clone())
-            .unwrap_or_else(|| "10.255.0.254".to_string());
+            .map(|(_, _, i, _)| *i)
+    }
 
-        if let Err(e) = self
-            .wireguard
+    /// Bring up one WireGuard plane on this node and program every other node as a
+    /// peer on it. The WireGuard `endpoint` is the peer's real underlay address;
+    /// the `allowed-ips` is the peer's overlay address *on this plane only*, so the
+    /// three planes stay isolated. Best-effort.
+    async fn program_plane(&self, plane: WgPlane, plan: &[(Id, String, usize, Option<String>)]) {
+        let wg = WireguardUnderlay::new(plane.iface, plane.port);
+        let my_kp = KeyPair::from_seed_name(&self.node_id);
+        let my_ip = self
+            .self_index(plan)
+            .map(|i| plane.ip(i))
+            .unwrap_or_else(|| format!("{}.254", plane.prefix));
+        if let Err(e) = wg
             .ensure_interface(&my_kp.secret.to_wireguard_key(), &format!("{my_ip}/16"))
             .await
         {
-            tracing::warn!(error = %e, "wireguard interface setup failed (best-effort)");
+            tracing::warn!(plane = plane.iface, error = %e, "wireguard interface setup failed");
         }
-
-        for (_, name, wg_ip, endpoint) in &plan {
+        for (_, name, index, addr) in plan {
             if name == &self.node_id {
                 continue;
             }
-            let Some(endpoint) = endpoint else { continue };
+            let Some(addr) = addr else { continue };
             let peer_pub = KeyPair::from_seed_name(name).public.to_wireguard_key();
-            // allowed-ips = just the peer's underlay /32 (it carries VXLAN); the
-            // peer's tenants stay isolated by VNI in the overlay, not here.
-            let allowed = format!("{wg_ip}/32");
-            if let Err(e) = self
-                .wireguard
-                .set_peer(&peer_pub, endpoint, &allowed, 25)
-                .await
-            {
-                tracing::warn!(peer = %name, error = %e, "wireguard peer programming failed");
+            let endpoint = format!("{addr}:{}", plane.port);
+            let allowed = format!("{}/32", plane.ip(*index));
+            if let Err(e) = wg.set_peer(&peer_pub, &endpoint, &allowed, 25).await {
+                tracing::warn!(plane = plane.iface, peer = %name, error = %e, "wireguard peer failed");
             }
         }
-        tracing::info!(peers = plan.len().saturating_sub(1), "wireguard underlay programmed");
     }
 
-    /// The VXLAN VTEP addresses of the *other* nodes — now the peers' **WireGuard**
-    /// addresses, so VXLAN-encapsulated workload traffic rides the encrypted
-    /// underlay. Excludes this node (matched by name to `config.node_id`).
+    /// Bring up all three isolated WireGuard underlays (management, workload,
+    /// load-balancer) and program peers on each. The control plane dials the
+    /// `wg-mgmt` addresses, VXLAN VTEPs the `wg-data` addresses, and the LB the
+    /// `wg-lb` addresses — so the planes never share an interface or address space.
+    pub async fn program_wireguard(&self) {
+        let plan = self.machine_plan().await;
+        if plan.is_empty() {
+            return;
+        }
+        for plane in [WG_MGMT, WG_DATA, WG_LB] {
+            self.program_plane(plane, &plan).await;
+        }
+        tracing::info!(
+            peers = plan.len().saturating_sub(1),
+            "wireguard planes programmed (mgmt/data/lb)"
+        );
+    }
+
+    /// The VXLAN VTEP addresses of the *other* nodes — their **wg-data** overlay
+    /// addresses, so workload traffic rides the isolated workload underlay (never
+    /// the management plane). Excludes this node.
     pub async fn peer_vteps(&self) -> Vec<String> {
-        self.wireguard_plan()
+        self.machine_plan()
             .await
             .into_iter()
             .filter(|(_, name, _, _)| name != &self.node_id)
-            .map(|(_, _, wg_ip, _)| wg_ip)
+            .map(|(_, _, index, _)| WG_DATA.ip(index))
             .collect()
+    }
+
+    /// The control-plane address (on `wg-mgmt`) the node at `index` is reached at.
+    pub(crate) fn mgmt_endpoint(&self, index: usize) -> String {
+        format!("{}:{}", WG_MGMT.ip(index), self.config.fabric_control_port)
     }
 
     /// Program every VPC's VXLAN overlay with the current peer VTEP set (the
@@ -661,7 +688,10 @@ async fn seed_loadbalancers(controller: &LoadBalancerController) -> Result<()> {
         .create(
             LoadBalancer::new("web-https", LbKind::Application, RoutingPolicy::Latency)
                 .with_listener(Listener::tls(443))
-                .with_hostname("app.example.com"),
+                .with_hostname("app.example.com")
+                // Fronts the `app=web` workloads — the same label set an
+                // autoscaler would govern; backends resolve on the wg-lb plane.
+                .fronting("app", "web"),
         )
         .await?;
     controller

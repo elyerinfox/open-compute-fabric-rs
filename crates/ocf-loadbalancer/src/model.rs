@@ -112,6 +112,13 @@ impl LoadBalancer {
         self
     }
 
+    /// Add a label to the target selector — the workloads this LB fronts (the
+    /// same label set an autoscaler governs). Chainable to require several.
+    pub fn fronting(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.target_selector.insert(key.into(), value.into());
+        self
+    }
+
     /// Whether `backend` is allowed to serve this load balancer given its
     /// `placement` constraint. A fleet-wide LB (no placement) accepts any
     /// backend; a scoped LB accepts only backends whose scope it contains.

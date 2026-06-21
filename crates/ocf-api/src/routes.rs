@@ -42,6 +42,7 @@ pub fn api_router(controller: Arc<FabricController>) -> Router {
         .route("/api/v1/networks/subnets", get(subnets))
         .route("/api/v1/networks/subnets/:id/egress", post(set_subnet_egress))
         .route("/api/v1/loadbalancers", get(loadbalancers))
+        .route("/api/v1/loadbalancers/:id/backends", get(lb_backends))
         .route("/api/v1/disks", get(disks))
         .route("/api/v1/metrics/host", get(host_metrics))
         .route("/api/v1/fabric/peers", get(fabric_peers))
@@ -257,6 +258,16 @@ struct EgressBody {
 
 async fn loadbalancers(State(c): Ctrl) -> ApiResult<Json<Vec<ocf_loadbalancer::LoadBalancer>>> {
     Ok(Json(c.loadbalancers.list().await?))
+}
+
+/// `GET /api/v1/loadbalancers/:id/backends` — the LB's live backend set resolved
+/// from its `target_selector` (matching workloads addressed on the wg-lb plane).
+async fn lb_backends(
+    State(c): Ctrl,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<ocf_loadbalancer::Backend>>> {
+    let lb = c.loadbalancers.get(&Id::from(id)).await?;
+    Ok(Json(c.resolve_lb_backends(&lb).await))
 }
 
 async fn disks(State(c): Ctrl) -> ApiResult<Json<Vec<ocf_disk::PhysicalDisk>>> {

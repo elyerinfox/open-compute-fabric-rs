@@ -12,27 +12,46 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::Utc;
+use std::collections::BTreeMap;
+
 use ocf_core::prelude::*;
 use ocf_fabric::{
     plan_route, FabricNode, FabricServer, KeyPair, Liveness, MembershipEvent, NoiseTransport,
     NodeId, Reachability, RoutePlan,
 };
+use ocf_loadbalancer::{Backend, LoadBalancer};
+use ocf_runtime::Workload;
 use ocf_topology::Machine;
 
-use crate::controller::{node_for_machine, FabricController};
+use crate::controller::{node_for_machine, FabricController, WG_DATA, WG_LB, WG_MGMT};
 
 impl FabricController {
     /// Register every topology machine into the membership detector and the
     /// mesh as an alive peer.
+    ///
+    /// The control plane is **unified over the `wg-mgmt` underlay**: each peer's
+    /// dialable endpoint is its management overlay address (`10.255.0.x`), not its
+    /// physical address — so Raft, membership gossip, and the latency prober all
+    /// flow over the encrypted management WireGuard, isolated from the workload
+    /// (`wg-data`) and load-balancer (`wg-lb`) planes.
     pub async fn init_membership(&self) -> Result<()> {
-        for machine in self.topology.store().all_machines().await? {
-            let node = node_for_machine(&machine);
+        let machines = self.topology.store().all_machines().await?;
+        let mut sorted: Vec<&Machine> = machines.iter().collect();
+        sorted.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+        for machine in &machines {
+            let mut node = node_for_machine(machine);
+            if let Some(i) = sorted
+                .iter()
+                .position(|m| m.metadata.name == machine.metadata.name)
+            {
+                node.endpoints = vec![self.mgmt_endpoint(i)];
+            }
             self.membership.join(node.clone());
             self.fabric.join(node)?;
         }
         tracing::info!(
             members = self.membership.members().len(),
-            "membership initialized"
+            "membership initialized (control plane on wg-mgmt)"
         );
         Ok(())
     }
@@ -105,6 +124,53 @@ impl FabricController {
             .collect()
     }
 
+    /// Resolve a load balancer's live backend set from its `target_selector`:
+    /// the workloads matching the selector, addressed on the **wg-lb** plane at
+    /// their hosting node, with measured RTT stamped. As an autoscaler with the
+    /// same selector adds or removes replicas, this set follows — making the LB ↔
+    /// autoscaling-group association live, over the isolated load-balancer underlay.
+    pub async fn resolve_lb_backends(&self, lb: &LoadBalancer) -> Vec<Backend> {
+        let plan = self.machine_plan().await;
+        let machines = self
+            .topology
+            .store()
+            .all_machines()
+            .await
+            .unwrap_or_default();
+        let mut workloads = Vec::new();
+        for provider in self.runtimes.all() {
+            workloads.extend(provider.list().await.unwrap_or_default());
+        }
+
+        let node_index = |id: &Id| {
+            plan.iter()
+                .find(|(mid, _, _, _)| mid == id)
+                .map(|(_, _, i, _)| *i)
+        };
+        let node_lb_addr = |id: &Id| node_index(id).map(|i| WG_LB.ip(i));
+        let node_scope = |id: &Id| {
+            machines
+                .iter()
+                .find(|m| &m.metadata.id == id)
+                .map(|m| m.scope())
+                .unwrap_or_else(Scope::fleet)
+        };
+        let node_latency = |id: &Id| {
+            machines
+                .iter()
+                .find(|m| &m.metadata.id == id)
+                .and_then(|m| self.membership.rtt(&KeyPair::from_seed_name(&m.metadata.name).node_id()))
+        };
+
+        lb_backends_for(
+            &workloads,
+            &lb.target_selector,
+            node_lb_addr,
+            node_scope,
+            node_latency,
+        )
+    }
+
     /// The measured-latency view from this node: `node_id -> last RTT (ms)`.
     ///
     /// This is the bridge between the fabric's latency map and the **load
@@ -139,34 +205,18 @@ impl FabricController {
             }
         }
         let client = NoiseTransport::with_keypair(self.node_keypair());
+        let self_id = self.node_keypair().node_id();
         let mut interval = tokio::time::interval(StdDuration::from_secs(5));
         loop {
             interval.tick().await;
-            let machines = self
-                .topology
-                .store()
-                .all_machines()
-                .await
-                .unwrap_or_default();
             for member in self.membership.members() {
-                if !member.liveness.is_available() {
+                if !member.liveness.is_available() || member.node.node_id == self_id {
                     continue;
                 }
-                let Some(mid) = &member.node.machine_id else { continue };
-                let Some(addr) = machines
-                    .iter()
-                    .find(|m| &m.metadata.id == mid)
-                    .and_then(|m| m.fabric_address.clone())
-                else {
-                    continue;
-                };
-                let target = FabricNode::new(
-                    member.node.node_id.clone(),
-                    member.node.public_key.clone(),
-                    vec![format!("{addr}:{port}")],
-                );
+                // The member's endpoint is already its wg-mgmt control address, so
+                // the probe (and its RTT) reflect the management plane directly.
                 let t = std::time::Instant::now();
-                if client.request(&target, b"ping").await.is_ok() {
+                if client.request(&member.node, b"ping").await.is_ok() {
                     let rtt = t.elapsed().as_secs_f64() * 1000.0;
                     self.membership.record_rtt(&member.node.node_id, rtt);
                 }
@@ -335,6 +385,37 @@ pub(crate) fn machine_satisfies(workload: &ocf_runtime::Workload, machine: &Mach
         && workload.resources.fits_in(&machine.capacity)
 }
 
+/// Resolve a load balancer's `target_selector` to its live backend set: the
+/// scheduled workloads whose labels match, each addressed at its hosting node's
+/// **wg-lb** address, scoped to that node, with measured RTT stamped (for the
+/// `Latency` policy). An empty selector resolves to no backends. This is the
+/// live LB ↔ workloads/autoscaling-group association — the same label set an
+/// autoscaler governs is the set the LB fronts.
+pub(crate) fn lb_backends_for(
+    workloads: &[Workload],
+    selector: &BTreeMap<String, String>,
+    node_lb_addr: impl Fn(&Id) -> Option<String>,
+    node_scope: impl Fn(&Id) -> Scope,
+    node_latency: impl Fn(&Id) -> Option<f64>,
+) -> Vec<Backend> {
+    if selector.is_empty() {
+        return Vec::new();
+    }
+    workloads
+        .iter()
+        .filter(|w| w.metadata.matches_labels(selector))
+        .filter_map(|w| {
+            let node = w.node.as_ref()?;
+            let addr = node_lb_addr(node)?; // skip unscheduled / unknown nodes
+            let mut backend = Backend::new(w.metadata.id.clone(), addr, node_scope(node));
+            if let Some(rtt) = node_latency(node) {
+                backend = backend.with_latency(rtt);
+            }
+            Some(backend)
+        })
+        .collect()
+}
+
 /// Render a [`Reachability`] as a stable lowercase string for the API.
 fn reachability_str(r: Reachability) -> &'static str {
     match r {
@@ -371,7 +452,7 @@ pub struct MemberView {
     pub last_heartbeat: String,
 }
 
-/// One node's WireGuard peer entry, for the API.
+/// One peer's address on one WireGuard plane, for the API.
 #[derive(Serialize)]
 pub struct WireguardPeerView {
     pub name: String,
@@ -380,47 +461,74 @@ pub struct WireguardPeerView {
     pub public_key: String,
 }
 
-/// The computed WireGuard underlay mesh: this node and its peers. Lets you
-/// inspect the encrypted-overlay wiring even on a host where the kernel
-/// programming can't run.
+/// One isolated WireGuard plane (control / workload / load-balancer).
 #[derive(Serialize)]
-pub struct WireguardView {
+pub struct WireguardPlaneView {
     pub iface: String,
-    pub node: String,
+    pub purpose: String,
     pub node_ip: String,
-    pub public_key: String,
-    pub vxlan_rides_wireguard: bool,
+    pub port: u16,
     pub peers: Vec<WireguardPeerView>,
 }
 
+/// The three computed WireGuard underlay planes: this node and its peers on each.
+/// Lets you inspect the isolated-overlay wiring even where the kernel programming
+/// can't run.
+#[derive(Serialize)]
+pub struct WireguardView {
+    pub node: String,
+    pub public_key: String,
+    pub planes: Vec<WireguardPlaneView>,
+}
+
 impl FabricController {
-    /// The computed WireGuard mesh (this node + peers, with their WG keys and
-    /// underlay endpoints). VXLAN VTEPs point at these WireGuard addresses.
+    /// The computed WireGuard planes (this node + peers per plane). Control rides
+    /// `wg-mgmt`, the VXLAN workload overlay `wg-data`, the LB `wg-lb` — three
+    /// isolated encrypted underlays.
     pub async fn wireguard_status(&self) -> WireguardView {
-        let plan = self.wireguard_plan().await;
+        let plan = self.machine_plan().await;
         let my_kp = ocf_fabric::KeyPair::from_seed_name(&self.node_id);
-        let node_ip = plan
+        let self_idx = plan
             .iter()
             .find(|(_, name, _, _)| name == &self.node_id)
-            .map(|(_, _, ip, _)| ip.clone())
-            .unwrap_or_else(|| "10.255.0.254".to_string());
-        let peers = plan
-            .into_iter()
-            .filter(|(_, name, _, _)| name != &self.node_id)
-            .map(|(_, name, wg_ip, endpoint)| WireguardPeerView {
-                public_key: ocf_fabric::KeyPair::from_seed_name(&name).public.to_wireguard_key(),
-                name,
-                wg_ip,
-                endpoint,
-            })
-            .collect();
+            .map(|(_, _, i, _)| *i);
+
+        let planes = [
+            (WG_MGMT, "control"),
+            (WG_DATA, "workload"),
+            (WG_LB, "load-balancer"),
+        ]
+        .into_iter()
+        .map(|(plane, purpose)| {
+            let node_ip = self_idx
+                .map(|i| plane.ip(i))
+                .unwrap_or_else(|| format!("{}.254", plane.prefix));
+            let peers = plan
+                .iter()
+                .filter(|(_, name, _, _)| name != &self.node_id)
+                .map(|(_, name, index, addr)| WireguardPeerView {
+                    name: name.clone(),
+                    wg_ip: plane.ip(*index),
+                    endpoint: addr.as_ref().map(|a| format!("{a}:{}", plane.port)),
+                    public_key: ocf_fabric::KeyPair::from_seed_name(name)
+                        .public
+                        .to_wireguard_key(),
+                })
+                .collect();
+            WireguardPlaneView {
+                iface: plane.iface.to_string(),
+                purpose: purpose.to_string(),
+                node_ip,
+                port: plane.port,
+                peers,
+            }
+        })
+        .collect();
+
         WireguardView {
-            iface: self.wireguard.iface().to_string(),
             node: self.node_id.clone(),
-            node_ip,
             public_key: my_kp.public.to_wireguard_key(),
-            vxlan_rides_wireguard: true,
-            peers,
+            planes,
         }
     }
 
@@ -490,5 +598,43 @@ mod tests {
         let mut big = Workload::container("big", "img");
         big.resources = ResourceSpec::new(4000, 8 * 1024 * 1024 * 1024, 0);
         assert!(!machine_satisfies(&big, &small), "should not fit");
+    }
+
+    #[test]
+    fn lb_backends_resolve_from_selector_on_wg_lb() {
+        use super::lb_backends_for;
+        use std::collections::BTreeMap;
+
+        let mut web = Workload::container("web-1", "img");
+        web.metadata.labels.insert("app".into(), "web".into());
+        web.node = Some(Id::named("node-a"));
+
+        let mut db = Workload::container("db-1", "img");
+        db.metadata.labels.insert("app".into(), "db".into());
+        db.node = Some(Id::named("node-b"));
+
+        let mut unscheduled = Workload::container("web-2", "img");
+        unscheduled.metadata.labels.insert("app".into(), "web".into());
+        unscheduled.node = None; // not placed → excluded
+
+        let workloads = vec![web, db, unscheduled];
+        let mut selector = BTreeMap::new();
+        selector.insert("app".to_string(), "web".to_string());
+
+        let backends = lb_backends_for(
+            &workloads,
+            &selector,
+            |id| (id.as_str() == "node-a").then(|| "10.253.0.1:0".to_string()),
+            |_| Scope::fleet(),
+            |_| Some(2.5),
+        );
+
+        // Only the scheduled, matching workload, addressed on the wg-lb plane.
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].address, "10.253.0.1:0");
+        assert_eq!(backends[0].latency_ms, 2.5);
+
+        // Empty selector → no backends.
+        assert!(lb_backends_for(&workloads, &BTreeMap::new(), |_| None, |_| Scope::fleet(), |_| None).is_empty());
     }
 }

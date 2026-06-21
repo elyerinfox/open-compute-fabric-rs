@@ -6,7 +6,7 @@
 |---|---|
 | **Source** | `crates/ocf-fabric/src/` (`lib.rs`, `crypto.rs`, `node.rs`, `wire.rs`, `transport.rs`, `server.rs`, `mesh.rs`, `membership.rs`) |
 | **Depends on** | [`ocf-core`](ocf-core.md) (prelude: `Provider`, `Registry`, `Id`, `Error`/`Result`, `Serialize`/`Deserialize`), `x25519-dalek`, `snow` (Noise), `rand`, `tokio` (TCP, `sync`), `async-trait`, `parking_lot`, `chrono` |
-| **Used by** | [`ocf-consensus`](ocf-consensus.md) (the Raft RPC layer rides `NoiseTransport::request`), the controller (mesh membership + broadcast), and [`ocf-topology`](ocf-topology.md)'s `Machine.fabric_address` (the endpoint a node is dialed on) |
+| **Used by** | [`ocf-consensus`](ocf-consensus.md) (the Raft RPC layer rides `NoiseTransport::request`), the controller (mesh membership + broadcast), and [`ocf-topology`](ocf-topology.md)'s `Machine.fabric_address` (the underlay address each node's WireGuard endpoints point at) |
 
 ## Overview
 
@@ -570,7 +570,7 @@ state-machine tests for the detector.
 
 - [Architecture → Distributed Control Plane](../architecture/distributed-control-plane.md) — how the mesh, membership, and Raft consensus fit together
 - [ocf-consensus](ocf-consensus.md) — the Raft RPC layer built on `NoiseTransport::request`
-- [ocf-topology](ocf-topology.md) — `Machine.fabric_address`, the endpoint a `FabricNode` is dialed on
+- [ocf-topology](ocf-topology.md) — `Machine.fabric_address`, the underlay address a node's WireGuard endpoints point at (the control plane itself dials the `wg-mgmt` overlay address)
 - [ocf-core](ocf-core.md) — `Provider`/`Registry` (pluggable transports), `Id`, `Error`/`Result`
 - [Operations → Security](../operations/security.md) — the crypto (X25519, ChaCha20-Poly1305, Noise XX) and identity persistence
 - [Reference → Error Codes](../reference/error-codes.md) — the `Error` → HTTP mapping
