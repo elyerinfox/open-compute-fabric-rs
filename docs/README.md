@@ -82,6 +82,8 @@ Install the toolchain, build the workspace, and run the daemon + frontend.
 |----------|----------------|
 | [Installation](getting-started/installation.md) | Rust/Node toolchain, optional host tools (`docker`, `ip`, `lsblk`, …) |
 | [Quickstart](getting-started/quickstart.md) | Build, `ocfd serve`, open the UI |
+| [Core concepts](getting-started/concepts.md) | The mental model — control vs data plane, scopes, the fabric & its three planes, networking, placement |
+| [Using the fabric](getting-started/using-the-fabric.md) | A hands-on guided tour: explore the fleet, network, fabric, health, workloads, and HA |
 | [Configuration](getting-started/configuration.md) | CLI flags, environment variables, the data directory |
 
 ### 🏛️ [Architecture](architecture/)
