@@ -37,6 +37,7 @@ pub fn api_router(controller: Arc<FabricController>) -> Router {
             "/api/v1/workloads/:id/network",
             post(attach_workload).delete(detach_workload),
         )
+        .route("/api/v1/workloads/:id/candidates", get(workload_candidates))
         .route("/api/v1/networks/vpcs", get(vpcs))
         .route("/api/v1/networks/subnets", get(subnets))
         .route("/api/v1/networks/subnets/:id/egress", post(set_subnet_egress))
@@ -45,6 +46,8 @@ pub fn api_router(controller: Arc<FabricController>) -> Router {
         .route("/api/v1/metrics/host", get(host_metrics))
         .route("/api/v1/fabric/peers", get(fabric_peers))
         .route("/api/v1/fabric/membership", get(membership))
+        .route("/api/v1/fabric/wireguard", get(wireguard_status))
+        .route("/api/v1/fabric/routes", get(fabric_routes))
         .route("/api/v1/fabric/machines/:id/heartbeat", post(heartbeat_machine))
         .route("/api/v1/fabric/machines/:id/fail", post(fail_machine))
         .route("/api/v1/admin/persist", post(persist_state))
@@ -195,6 +198,30 @@ struct AttachBody {
     egress: bool,
 }
 
+/// `GET /api/v1/workloads/:id/candidates` — the machines a workload can be
+/// (re)scheduled onto, given its scope, required node capabilities
+/// (`node_selector`), and capacity. Shows how capability flags restrict placement.
+async fn workload_candidates(State(c): Ctrl, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    let wid = Id::from(id);
+    let workload = c
+        .all_workloads()
+        .await
+        .into_iter()
+        .find(|w| w.metadata.id == wid)
+        .ok_or_else(|| Error::not_found(format!("workload {wid}")))?;
+    let candidates: Vec<Value> = c
+        .candidate_nodes(&workload)
+        .await
+        .into_iter()
+        .map(|m| json!({ "id": m.metadata.id.as_str(), "name": m.metadata.name }))
+        .collect();
+    Ok(Json(json!({
+        "workload": workload.metadata.name,
+        "node_selector": workload.node_selector,
+        "candidates": candidates,
+    })))
+}
+
 async fn vpcs(State(c): Ctrl) -> ApiResult<Json<Vec<ocf_network::Vpc>>> {
     Ok(Json(c.network.list_vpcs().await?))
 }
@@ -246,6 +273,18 @@ async fn fabric_peers(State(c): Ctrl) -> Json<Vec<ocf_fabric::FabricNode>> {
 
 async fn membership(State(c): Ctrl) -> Json<Vec<crate::fleet::MemberView>> {
     Json(c.membership_view())
+}
+
+/// `GET /api/v1/fabric/wireguard` — the computed WireGuard underlay mesh (this
+/// node + peers); the VXLAN overlay's VTEPs point at these WireGuard addresses.
+async fn wireguard_status(State(c): Ctrl) -> Json<crate::fleet::WireguardView> {
+    Json(c.wireguard_status().await)
+}
+
+/// `GET /api/v1/fabric/routes` — the planned route from this node to every peer
+/// (direct vs relayed, weighed by measured RTT). The fabric's path selection.
+async fn fabric_routes(State(c): Ctrl) -> Json<Vec<crate::fleet::RouteView>> {
+    Json(c.routes_view())
 }
 
 /// `POST /api/v1/fabric/machines/:id/heartbeat` — keep a node alive.

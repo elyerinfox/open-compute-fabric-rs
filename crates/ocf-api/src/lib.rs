@@ -59,6 +59,8 @@ pub async fn serve(
 ) -> Result<()> {
     // Start the membership failure detector before serving requests.
     tokio::spawn(controller.clone().run_failure_detector());
+    // Start the fabric control channel: ping server + latency prober.
+    tokio::spawn(controller.clone().run_latency_services());
 
     let app = build_app(controller, static_dir);
     let listener = tokio::net::TcpListener::bind(addr).await?;

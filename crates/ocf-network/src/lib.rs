@@ -24,10 +24,14 @@ pub mod backend;
 pub mod controller;
 pub mod ipam;
 pub mod model;
+pub mod wireguard;
 
 pub use backend::{register_builtins, LinuxNetnsBackend, NetworkBackend, OvsBackend};
 pub use controller::NetworkController;
 pub use ipam::SubnetAllocator;
+pub use wireguard::{
+    attach_container_to_subnet, attach_workload_veth, subnet_bridge_name, WireguardUnderlay,
+};
 pub use model::{
     AclAction, AclDirection, AclRule, AclScope, EgressMode, FirewallPolicy, Route, Subnet, Vpc,
 };

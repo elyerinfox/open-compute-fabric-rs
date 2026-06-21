@@ -467,6 +467,56 @@ flowchart LR
 > per-VPC NAT gateway — which would give a stable egress IP — remains the
 > alternative topology if that property is later required.
 
+## WireGuard underlay — encrypting the overlay
+
+By default VXLAN encapsulates L2 frames in plain UDP on the underlay. To encrypt
+all cross-host workload traffic at kernel line rate, the overlay rides a
+**WireGuard underlay**: a real kernel `wireguard` interface between hosts, with
+VXLAN's VTEP endpoints pointed at the peers' WireGuard addresses.
+
+`WireguardUnderlay` (`crates/ocf-network/src/wireguard.rs`) programs it via `ip` + `wg`:
+
+| Method | Commands |
+|--------|----------|
+| `ensure_interface(priv_key, addr)` | `ip link add wg-ocf type wireguard`; `wg set wg-ocf private-key <file> listen-port 51820`; `ip addr add <addr> dev wg-ocf`; `ip link set wg-ocf up` |
+| `set_peer(pub_key, endpoint, allowed_ips, keepalive)` | `wg set wg-ocf peer <key> endpoint <ep> allowed-ips <ip/32> persistent-keepalive 25` |
+| `attach_workload_veth(netns, bridge, id, addr)` | a veth pair: one end into the workload netns (addressed), the other onto the subnet bridge — splices a workload onto the overlay |
+| `attach_container_to_subnet(pid, alias, bridge, id, addr)` | exposes a **running container's** netns (via its host PID → `ip netns attach`) then `attach_workload_veth` — the last mile for live containers |
+
+When a workload attaches to a subnet (`POST /api/v1/workloads/:id/network`), the
+[`ocf-api`](ocf-api.md) controller resolves the container's host PID
+(`RuntimeProvider::host_pid` → `docker inspect -f '{{.State.Pid}}'`), computes the
+subnet bridge name, and best-effort `attach_container_to_subnet`s it with its IPAM
+address — putting the live container on the WireGuard-encrypted VXLAN overlay.
+
+A node's **WireGuard identity is its fabric identity**: the `ocf-fabric` X25519
+keypair *is* a Curve25519 WireGuard key (`PublicKey::to_wireguard_key()` /
+`SecretKey::to_wireguard_key()` base64-encode it). The peer set is the fabric
+membership. The [`ocf-api`](ocf-api.md) controller assigns each machine a
+WireGuard address (`10.255.0.{i}`), brings up the interface, programs peers, and
+points the VXLAN VTEPs at the WireGuard IPs (`GET /api/v1/fabric/wireguard` shows
+the computed mesh).
+
+### Layering: where isolation lives
+
+WireGuard here is a **flat L3 underlay** — encryption and reachability, **not**
+tenant isolation. Isolation and subnetting stay in the overlay, exactly as
+before; the encryption is added underneath without moving any of it:
+
+```mermaid
+flowchart TB
+    pol["Policy: nftables ACLs per VPC/subnet  → micro-segmentation"]
+    ovl["Overlay: VXLAN VNI per VPC + subnet CIDRs → ISOLATION + subnetting"]
+    und["Underlay: WireGuard mesh (flat, kernel)  → encryption + reachability"]
+    pol --> ovl --> und
+```
+
+So a VPC is still an isolated VNI, subnets still carve CIDRs, ACLs still segment
+— and now every VPC's VXLAN traffic is WireGuard-encrypted over the shared
+underlay. Per-peer WireGuard `allowed-ips` are deliberately *not* used for tenant
+isolation (too coarse — per host, not per tenant); each peer just gets the
+others' underlay `/32`.
+
 ## Public API surface
 
 | Item | Kind | Notes |

@@ -18,6 +18,5 @@ tokio.workspace = true
 snow.workspace = true
 x25519-dalek.workspace = true
 rand.workspace = true
-
-[dev-dependencies]
+zstd.workspace = true
 serde_json.workspace = true

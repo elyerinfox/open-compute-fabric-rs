@@ -57,6 +57,11 @@ pub struct MemberState {
     /// SWIM incarnation number — bumped by a node to refute a suspicion about
     /// itself. Carried here for the refutation path.
     pub incarnation: u64,
+    /// Last measured round-trip latency to this peer, in milliseconds. `None`
+    /// until a successful probe (or for an unreachable peer). Feeds latency-aware
+    /// routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
 }
 
 /// A transition the failure detector observed.
@@ -126,6 +131,7 @@ impl Membership {
                         liveness: Liveness::Alive,
                         last_heartbeat: now,
                         incarnation: 0,
+                        rtt_ms: None,
                     },
                 );
                 MembershipEvent::Joined(id)
@@ -173,6 +179,19 @@ impl Membership {
             .values()
             .find(|m| m.node.machine_id.as_ref() == Some(machine_id))
             .cloned()
+    }
+
+    /// Record a measured round-trip latency (ms) to `id`. No-op for unknown
+    /// members.
+    pub fn record_rtt(&self, id: &NodeId, rtt_ms: f64) {
+        if let Some(m) = self.members.write().get_mut(id) {
+            m.rtt_ms = Some(rtt_ms);
+        }
+    }
+
+    /// The last measured RTT (ms) to `id`, if any.
+    pub fn rtt(&self, id: &NodeId) -> Option<f64> {
+        self.members.read().get(id).and_then(|m| m.rtt_ms)
     }
 
     /// Gracefully mark `id` as having left the fleet.
@@ -304,6 +323,20 @@ mod tests {
         let ev = m.heartbeat_at(&id, t0 + Duration::seconds(7));
         assert_eq!(ev, Some(MembershipEvent::Recovered(id.clone())));
         assert_eq!(m.liveness(&id), Some(Liveness::Alive));
+    }
+
+    #[test]
+    fn records_and_reads_rtt() {
+        let m = membership();
+        let peer = node("peer");
+        let id = peer.node_id.clone();
+        m.join(peer);
+        assert_eq!(m.rtt(&id), None);
+        m.record_rtt(&id, 1.42);
+        assert_eq!(m.rtt(&id), Some(1.42));
+        // Unknown member is a no-op.
+        m.record_rtt(&NodeId::new("ghost"), 9.0);
+        assert_eq!(m.rtt(&NodeId::new("ghost")), None);
     }
 
     #[test]

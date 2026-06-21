@@ -21,7 +21,9 @@ use ocf_consensus::ReplicatedStore;
 use ocf_auth::{Authenticator, LinuxUserSync, LocalAuthenticator};
 use ocf_authz::{Group, RbacEngine, RoleBinding, Subject, User, ADMINISTRATOR_ROLE};
 use ocf_disk::{DiskHealth, DiskService, LedControl, PhysicalDisk, SysfsDiskManager};
-use ocf_fabric::{FabricMesh, FabricNode, FabricTransport, KeyPair, Membership, NodeId};
+use ocf_fabric::{
+    FabricMesh, FabricNode, FabricTransport, KeyPair, Membership, NodeId, Reachability,
+};
 use ocf_health::{HealthCheck, HealthService, PackageCheck};
 use ocf_platform::PlatformService;
 use ocf_inventory::InventoryService;
@@ -31,12 +33,15 @@ use ocf_loadbalancer::{
     RoutingPolicy,
 };
 use ocf_monitoring::MonitoringService;
-use ocf_network::{EgressMode, NetworkBackend, NetworkController, Subnet, Vpc};
+use ocf_network::{EgressMode, NetworkBackend, NetworkController, Subnet, Vpc, WireguardUnderlay};
 use ocf_runtime::{NetworkAttachment, RuntimeProvider, Workload};
 use ocf_store::{MemoryStateStore, RedbStateStore, StateStore};
 use ocf_topology::{Datacenter, InMemoryTopology, Machine, Rack, Region, TopologyService, TopologyStore};
 
 use crate::config::ControllerConfig;
+
+/// UDP port the WireGuard underlay listens on across the fleet.
+const WG_PORT: u16 = 51820;
 
 /// Every subsystem of the fabric, owned in one place.
 pub struct FabricController {
@@ -60,6 +65,8 @@ pub struct FabricController {
     pub monitoring: MonitoringService,
     pub fabric: FabricMesh,
     pub network: NetworkController,
+    /// The encrypted WireGuard underlay the VXLAN overlay rides on.
+    pub wireguard: WireguardUnderlay,
     pub loadbalancers: LoadBalancerController,
     pub cert_providers: Registry<dyn CertificateProvider>,
     pub dns_providers: Registry<dyn DnsProvider>,
@@ -128,6 +135,7 @@ impl FabricController {
         let mut net_backends = Registry::<dyn NetworkBackend>::new();
         ocf_network::register_builtins(&mut net_backends)?;
         let network = NetworkController::new(Arc::new(net_backends));
+        let wireguard = WireguardUnderlay::new("wg-ocf", WG_PORT);
 
         let mut cert_providers = Registry::<dyn CertificateProvider>::new();
         let mut dns_providers = Registry::<dyn DnsProvider>::new();
@@ -184,6 +192,7 @@ impl FabricController {
             monitoring,
             fabric,
             network,
+            wireguard,
             loadbalancers,
             cert_providers,
             dns_providers,
@@ -206,7 +215,10 @@ impl FabricController {
         // --- membership / mesh ----------------------------------------------
         controller.init_membership().await?;
 
-        // --- stitch the overlay across hosts --------------------------------
+        // --- encrypted underlay + overlay across hosts ----------------------
+        // Bring up the WireGuard underlay first, then point the VXLAN overlay's
+        // VTEPs at the WireGuard addresses so workload traffic is encrypted.
+        controller.program_wireguard().await;
         controller.program_vxlan_peers().await;
 
         Ok(controller)
@@ -297,8 +309,56 @@ impl FabricController {
             tracing::warn!(error = %e, "egress refresh after attach failed (binding recorded)");
         }
 
+        // Best-effort: splice the running container onto the subnet's overlay
+        // bridge (Linux + container runtime only).
+        self.splice_workload_overlay(workload_id, subnet_id, &attachment).await;
+
         let _ = self.persist().await;
         Ok(attachment)
+    }
+
+    /// Splice a workload's container onto its subnet's overlay bridge: resolve the
+    /// container's host PID from whichever runtime holds it, then create a veth
+    /// pair into the container's netns and onto the subnet bridge with the IPAM
+    /// address. Best-effort — a VM workload, a host without `ip`, or a stopped
+    /// container simply logs and is skipped.
+    async fn splice_workload_overlay(
+        &self,
+        workload_id: &Id,
+        subnet_id: &Id,
+        attachment: &NetworkAttachment,
+    ) {
+        let Some(address) = &attachment.address else { return };
+        // Find the runtime holding this workload and its container PID.
+        let mut pid = None;
+        for provider in self.runtimes.all() {
+            if let Ok(Some(p)) = provider.host_pid(workload_id).await {
+                pid = Some(p);
+                break;
+            }
+        }
+        let Some(pid) = pid else { return };
+        let subnet = match self.network.get_subnet(subnet_id).await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let prefix = subnet.cidr.split_once('/').map(|(_, p)| p).unwrap_or("24");
+        let cidr = format!("{address}/{prefix}");
+        let bridge = ocf_network::subnet_bridge_name(subnet_id);
+        let alias = format!("ocf-{}", workload_id.as_str().chars().take(8).collect::<String>());
+        if let Err(e) = ocf_network::attach_container_to_subnet(
+            pid,
+            &alias,
+            &bridge,
+            workload_id.as_str(),
+            &cidr,
+        )
+        .await
+        {
+            tracing::warn!(workload = %workload_id, error = %e, "overlay attach failed (best-effort)");
+        } else {
+            tracing::info!(workload = %workload_id, %cidr, bridge = %bridge, "container attached to overlay");
+        }
     }
 
     /// Detach a workload from its subnet: release its address and re-program the
@@ -317,24 +377,90 @@ impl FabricController {
         Ok(())
     }
 
-    /// The underlay VTEP addresses of the *other* nodes in the fleet — the peers
-    /// a VXLAN overlay must be stitched to. Derived from each machine's
-    /// `fabric_address`, excluding the machine that is this node (matched by name
-    /// to `config.node_id`, best-effort).
-    pub async fn peer_vteps(&self) -> Vec<String> {
-        let machines = match self.topology.store().all_machines().await {
+    /// Assign each machine a deterministic WireGuard underlay address
+    /// (`10.255.0.{i+1}/16`, machines sorted by name), returning
+    /// `(machine_id, name, wg_ip, underlay_endpoint)` per machine. The endpoint is
+    /// the machine's real `fabric_address` plus the WireGuard listen port.
+    pub(crate) async fn wireguard_plan(&self) -> Vec<(Id, String, String, Option<String>)> {
+        let mut machines = match self.topology.store().all_machines().await {
             Ok(m) => m,
             Err(_) => return Vec::new(),
         };
+        machines.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
         machines
             .into_iter()
-            .filter(|m| m.metadata.name != self.node_id)
-            .filter_map(|m| m.fabric_address)
+            .enumerate()
+            .map(|(i, m)| {
+                let wg_ip = format!("10.255.0.{}", i + 1);
+                let endpoint = m
+                    .fabric_address
+                    .as_ref()
+                    .map(|a| format!("{a}:{WG_PORT}"));
+                (m.metadata.id.clone(), m.metadata.name, wg_ip, endpoint)
+            })
             .collect()
     }
 
-    /// Program every VPC's VXLAN overlay with the current peer VTEP set, so the
-    /// overlay is stitched across hosts. Best-effort.
+    /// Bring up this node's WireGuard underlay interface (using its fabric
+    /// identity as the WireGuard key) and program every *other* node as a peer.
+    /// This is the encrypted, kernel-datapath underlay the VXLAN overlay rides.
+    /// Best-effort: a host without `wg`/`ip` logs and is skipped.
+    pub async fn program_wireguard(&self) {
+        let plan = self.wireguard_plan().await;
+        if plan.is_empty() {
+            return;
+        }
+        // This node's WireGuard identity == its fabric identity.
+        let my_kp = KeyPair::from_seed_name(&self.node_id);
+        let my_ip = plan
+            .iter()
+            .find(|(_, name, _, _)| name == &self.node_id)
+            .map(|(_, _, ip, _)| ip.clone())
+            .unwrap_or_else(|| "10.255.0.254".to_string());
+
+        if let Err(e) = self
+            .wireguard
+            .ensure_interface(&my_kp.secret.to_wireguard_key(), &format!("{my_ip}/16"))
+            .await
+        {
+            tracing::warn!(error = %e, "wireguard interface setup failed (best-effort)");
+        }
+
+        for (_, name, wg_ip, endpoint) in &plan {
+            if name == &self.node_id {
+                continue;
+            }
+            let Some(endpoint) = endpoint else { continue };
+            let peer_pub = KeyPair::from_seed_name(name).public.to_wireguard_key();
+            // allowed-ips = just the peer's underlay /32 (it carries VXLAN); the
+            // peer's tenants stay isolated by VNI in the overlay, not here.
+            let allowed = format!("{wg_ip}/32");
+            if let Err(e) = self
+                .wireguard
+                .set_peer(&peer_pub, endpoint, &allowed, 25)
+                .await
+            {
+                tracing::warn!(peer = %name, error = %e, "wireguard peer programming failed");
+            }
+        }
+        tracing::info!(peers = plan.len().saturating_sub(1), "wireguard underlay programmed");
+    }
+
+    /// The VXLAN VTEP addresses of the *other* nodes — now the peers' **WireGuard**
+    /// addresses, so VXLAN-encapsulated workload traffic rides the encrypted
+    /// underlay. Excludes this node (matched by name to `config.node_id`).
+    pub async fn peer_vteps(&self) -> Vec<String> {
+        self.wireguard_plan()
+            .await
+            .into_iter()
+            .filter(|(_, name, _, _)| name != &self.node_id)
+            .map(|(_, _, wg_ip, _)| wg_ip)
+            .collect()
+    }
+
+    /// Program every VPC's VXLAN overlay with the current peer VTEP set (the
+    /// WireGuard addresses), so the overlay is stitched across hosts and
+    /// encrypted. Best-effort.
     pub async fn program_vxlan_peers(&self) {
         let peers = self.peer_vteps().await;
         if peers.is_empty() {
@@ -426,6 +552,23 @@ async fn seed_topology(store: &Arc<dyn TopologyStore>) -> Result<Fleet> {
         m.capacity = ResourceSpec::new(32_000, 128 * 1024 * 1024 * 1024, 2 * 1024_u64.pow(4));
         m.state = LifecycleState::Running;
         m.health = Health::Healthy;
+        // Capability labels: node-3 is the GPU/NVMe box; node-1 has NVMe.
+        if i == 3 {
+            m.metadata.labels.insert("gpu".into(), "true".into());
+            m.metadata.labels.insert("nvme".into(), "true".into());
+        } else if i == 1 {
+            m.metadata.labels.insert("nvme".into(), "true".into());
+        }
+        // Reachability demo: node-1 is a relay; node-2 is private (NAT'd) and is
+        // therefore reached through the relay; node-3 is public.
+        let reach = match i {
+            1 => "relay",
+            2 => "private",
+            _ => "public",
+        };
+        m.metadata
+            .labels
+            .insert("fabric.reachability".into(), reach.into());
         machines.push((m.metadata.id.clone(), name));
         store.put_machine(m).await?;
     }
@@ -449,6 +592,14 @@ async fn seed_workloads(runtimes: &Registry<dyn RuntimeProvider>, fleet: &Fleet)
     vm.node = fleet.machines.get(2).map(|(id, _)| id.clone());
     vm.resources = ResourceSpec::new(4000, 8 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024);
     spawn_workload(&qemu, vm).await;
+
+    // A workload that requires the GPU capability — only schedulable on node-3.
+    let mut gpu = Workload::container("gpu-job", "cuda:12")
+        .requires("gpu", "true")
+        .highly_available(true);
+    gpu.resources = ResourceSpec::new(2000, 4 * 1024 * 1024 * 1024, 0);
+    gpu.node = fleet.machines.get(2).map(|(id, _)| id.clone()); // node-3
+    spawn_workload(&docker, gpu).await;
     Ok(())
 }
 
@@ -539,9 +690,22 @@ pub(crate) fn node_for_machine(machine: &Machine) -> FabricNode {
         .fabric_address
         .clone()
         .unwrap_or_else(|| format!("{}.fabric", machine.metadata.name));
+    // Reachability is declared by the `fabric.reachability` label (relay/private),
+    // defaulting to public — so a NAT'd or relay node is just a labeled machine.
+    let reachability = match machine
+        .metadata
+        .labels
+        .get("fabric.reachability")
+        .map(String::as_str)
+    {
+        Some("relay") => Reachability::Relay,
+        Some("private") => Reachability::Private,
+        _ => Reachability::Public,
+    };
     FabricNode::from_keypair(
         &KeyPair::from_seed_name(&machine.metadata.name),
         vec![format!("{endpoint}:51820")],
     )
     .with_machine(machine.metadata.id.clone())
+    .with_reachability(reachability)
 }

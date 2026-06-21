@@ -103,6 +103,9 @@ impl FabricTransport for NoiseTransport {
         let mut stream = TcpStream::connect(&endpoint)
             .await
             .map_err(|e| Error::provider("noise", format!("dial {endpoint}: {e}")))?;
+        // Disable Nagle: this is a request/response RPC transport, so batching
+        // small writes only adds latency.
+        let _ = stream.set_nodelay(true);
         let transport = wire::client_handshake(&mut stream, self.keypair.secret.as_bytes()).await?;
         tracing::info!(node = %node.node_id, %endpoint, "noise session established");
         conns.insert(
@@ -120,6 +123,40 @@ impl FabricTransport for NoiseTransport {
 }
 
 impl NoiseTransport {
+    /// Stream all of `reader` to `node` over a **dedicated** encrypted connection
+    /// (separate from the cached request/response session, so a multi-GB bulk
+    /// transfer never blocks control-plane RPC). Returns the bytes sent.
+    ///
+    /// The data is chunked into pipelined Noise records (see [`wire::send_stream`]),
+    /// so throughput is bounded by the cipher and the link, not by round-trips —
+    /// this is what makes VM-migration-sized transfers practical over the fabric.
+    /// When `compress` is set, records are zstd-compressed before sealing (a large
+    /// win for memory/disk images). The receiver
+    /// ([`FabricStreamServer`](crate::server::FabricStreamServer)) must run with
+    /// the same `compress` flag.
+    pub async fn send_stream<R>(
+        &self,
+        node: &FabricNode,
+        reader: &mut R,
+        compress: bool,
+    ) -> Result<u64>
+    where
+        R: tokio::io::AsyncReadExt + Unpin,
+    {
+        let endpoint = node
+            .primary_endpoint()
+            .ok_or_else(|| Error::invalid(format!("node {} has no endpoint", node.node_id)))?
+            .to_string();
+        let mut stream = TcpStream::connect(&endpoint)
+            .await
+            .map_err(|e| Error::provider("noise", format!("dial {endpoint}: {e}")))?;
+        let _ = stream.set_nodelay(true);
+        let mut transport = wire::client_handshake(&mut stream, self.keypair.secret.as_bytes()).await?;
+        let total = wire::send_stream(&mut stream, &mut transport, reader, compress).await?;
+        tracing::debug!(node = %node.node_id, bytes = total, compress, "streamed bulk transfer");
+        Ok(total)
+    }
+
     /// Send `payload` to `node` and return the peer's sealed response.
     ///
     /// This is the RPC primitive the Raft network layer is built on: one sealed
@@ -147,6 +184,58 @@ impl NoiseTransport {
         );
         Ok(reply)
     }
+
+    /// Send `payload` to a `target` that isn't directly dialable, by forwarding
+    /// through a `relay` node. The relay must be running a forwarding handler
+    /// (see [`forward_relayed`](NoiseTransport::forward_relayed)). The end-to-end
+    /// reply is returned. This is how a `Private`/NAT'd peer is reached.
+    ///
+    /// Note the relay sees ciphertext between itself and the target only at the
+    /// transport layer — it forwards the *request bytes*, so end-to-end payload
+    /// confidentiality from a relay would require an additional inner seal; today
+    /// the relay is trusted fleet infrastructure.
+    pub async fn request_via_relay(
+        &self,
+        relay: &FabricNode,
+        target: &FabricNode,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let endpoint = target
+            .primary_endpoint()
+            .ok_or_else(|| Error::invalid("relay target has no endpoint"))?
+            .to_string();
+        let envelope = RelayEnvelope {
+            target_endpoint: endpoint,
+            target_pubkey: target.public_key.as_bytes().to_vec(),
+            payload: payload.to_vec(),
+        };
+        let bytes = serde_json::to_vec(&envelope)
+            .map_err(|e| Error::invalid(format!("encode relay envelope: {e}")))?;
+        self.request(relay, &bytes).await
+    }
+
+    /// Relay-side forwarding: decode a [`RelayEnvelope`] received as a request,
+    /// dial the enclosed target, forward the inner payload, and return its reply.
+    /// Wire this as a relay node's request handler.
+    pub async fn forward_relayed(&self, request_bytes: &[u8]) -> Result<Vec<u8>> {
+        let envelope: RelayEnvelope = serde_json::from_slice(request_bytes)
+            .map_err(|e| Error::invalid(format!("decode relay envelope: {e}")))?;
+        let target = FabricNode::new(
+            NodeId::new("relayed-target"),
+            crate::crypto::PublicKey::from_bytes(envelope.target_pubkey),
+            vec![envelope.target_endpoint],
+        );
+        self.request(&target, &envelope.payload).await
+    }
+}
+
+/// A request to a relay: forward `payload` to the node at `target_endpoint`
+/// (authenticated by `target_pubkey`) and return its reply.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RelayEnvelope {
+    target_endpoint: String,
+    target_pubkey: Vec<u8>,
+    payload: Vec<u8>,
 }
 
 /// Register the built-in fabric transports into `reg`.
@@ -175,5 +264,45 @@ mod tests {
             vec!["127.0.0.1:1".into()],
         );
         assert!(t.connect(&node).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn relayed_request_reaches_private_target() {
+        use crate::node::Reachability;
+        use crate::server::FabricServer;
+
+        // Target: a private node that only echoes (stands in for a NAT'd peer
+        // reachable from the relay's network but not from the origin).
+        let target_kp = KeyPair::from_seed_name("relay-target");
+        let target_srv = FabricServer::bind("127.0.0.1:0", target_kp.clone())
+            .await
+            .expect("bind target");
+        let target_addr = target_srv.local_addr();
+        tokio::spawn(target_srv.run(|_pk, req| async move { req }));
+        let target = FabricNode::from_keypair(&target_kp, vec![target_addr.to_string()])
+            .with_reachability(Reachability::Private);
+
+        // Relay: forwards whatever it receives to the enclosed target.
+        let relay_kp = KeyPair::from_seed_name("relay-node");
+        let relay_srv = FabricServer::bind("127.0.0.1:0", relay_kp.clone())
+            .await
+            .expect("bind relay");
+        let relay_addr = relay_srv.local_addr();
+        let relay_transport = Arc::new(NoiseTransport::with_keypair(relay_kp.clone()));
+        let rt = relay_transport.clone();
+        tokio::spawn(relay_srv.run(move |_pk, req| {
+            let rt = rt.clone();
+            async move { rt.forward_relayed(&req).await.unwrap_or_default() }
+        }));
+        let relay = FabricNode::from_keypair(&relay_kp, vec![relay_addr.to_string()])
+            .with_reachability(Reachability::Relay);
+
+        // Origin reaches the private target *through* the relay.
+        let origin = NoiseTransport::new();
+        let reply = origin
+            .request_via_relay(&relay, &target, b"hello-private")
+            .await
+            .expect("relayed request");
+        assert_eq!(reply, b"hello-private");
     }
 }

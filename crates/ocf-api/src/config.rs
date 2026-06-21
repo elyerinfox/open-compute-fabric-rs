@@ -17,6 +17,8 @@ pub struct ControllerConfig {
     pub suspect_timeout_secs: i64,
     /// Additional seconds after suspicion before a peer is declared dead.
     pub dead_timeout_secs: i64,
+    /// Port for the fabric control channel (ping/latency probing) on each node.
+    pub fabric_control_port: u16,
 }
 
 impl Default for ControllerConfig {
@@ -27,6 +29,7 @@ impl Default for ControllerConfig {
             seeds: Vec::new(),
             suspect_timeout_secs: 5,
             dead_timeout_secs: 5,
+            fabric_control_port: 51821,
         }
     }
 }

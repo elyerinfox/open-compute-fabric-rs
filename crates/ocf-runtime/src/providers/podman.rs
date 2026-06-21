@@ -77,6 +77,18 @@ impl RuntimeProvider for PodmanRuntime {
         Ok(parse_container_status(&out))
     }
 
+    async fn host_pid(&self, id: &Id) -> Result<Option<u32>> {
+        // `podman inspect -f '{{.State.Pid}}' <id>` — 0 means not running.
+        let args = vec![
+            "inspect".to_string(),
+            "-f".to_string(),
+            "{{.State.Pid}}".to_string(),
+            id.to_string(),
+        ];
+        let out = command::run(BIN, &args).await?;
+        Ok(out.trim().parse::<u32>().ok().filter(|p| *p != 0))
+    }
+
     async fn list(&self) -> Result<Vec<Workload>> {
         // `podman ps -a --filter label=ocf=1
         //   --format '{{.ID}}|{{.Image}}|{{.Names}}|{{.State}}'`

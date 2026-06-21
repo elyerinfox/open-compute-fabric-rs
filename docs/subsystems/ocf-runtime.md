@@ -109,8 +109,25 @@ pub enum RuntimeKind { Container, VirtualMachine }
 | `node` | `Option<Id>` | The node it is currently placed on, if scheduled |
 | `highly_available` | `bool` | Keep running across node loss (migration-eligible within `placement`) |
 | `placement` | `Option<Scope>` | Placement restriction; `None` = whole fleet is fair game |
+| `node_selector` | `BTreeMap<String, String>` | **Required node capabilities** — a label selector a machine's `metadata.labels` must satisfy; empty = no requirement |
 | `env` | `BTreeMap<String, String>` | Environment variables injected into the workload (sorted, deterministic) |
 | `network` | `Option<NetworkAttachment>` | SDN subnet attachment + outbound-internet opt-in; `None` = backend default networking |
+
+### Capability-based placement
+
+`node_selector` lets a workload demand node capabilities (set via
+`Workload::requires("gpu", "true")`). Machines advertise capabilities as
+`metadata.labels` (e.g. a GPU box is labeled `gpu=true`). A workload is placeable
+on a machine only when **all three** hold (`FabricController::machine_satisfies`):
+
+1. **Scope** — `placement` permits the machine's topology scope.
+2. **Capability** — the machine's labels match every entry in `node_selector`.
+3. **Capacity** — the machine's `capacity` fits the workload's `resources`.
+
+This filter drives both `GET /api/v1/workloads/:id/candidates` (which nodes a
+workload can run on) and HA reschedule (`pick_target` won't move a GPU job onto a
+non-GPU node). Node *taints* (a node repelling workloads unless tolerated) are the
+natural complement and a clean extension on the same matching primitive.
 
 **`NetworkAttachment`** binds a workload to an `ocf-network` subnet (the `subnet_id` is a bare [`Id`] so this crate stays decoupled from `ocf-network`):
 

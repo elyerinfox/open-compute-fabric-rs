@@ -67,6 +67,14 @@ impl PublicKey {
     pub fn to_hex(&self) -> String {
         to_hex(&self.0)
     }
+
+    /// The key as a **WireGuard public key**: standard base64 of the 32-byte
+    /// Curve25519 point. Our identity keys are X25519, which is exactly
+    /// WireGuard's key type, so a node's fabric identity *is* its WireGuard
+    /// identity — no separate keyset.
+    pub fn to_wireguard_key(&self) -> String {
+        base64(&self.0)
+    }
 }
 
 impl std::fmt::Display for PublicKey {
@@ -89,6 +97,12 @@ impl SecretKey {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    /// The key as a **WireGuard private key**: standard base64 of the 32-byte
+    /// Curve25519 scalar. Feed to `wg set <iface> private-key`.
+    pub fn to_wireguard_key(&self) -> String {
+        base64(&self.0)
     }
 }
 
@@ -206,6 +220,31 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Standard base64 encoding (RFC 4648, with `=` padding) — used for WireGuard
+/// key formatting. A 32-byte key encodes to the 44-char form `wg` expects.
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(A[(b0 >> 2) as usize] as char);
+        out.push(A[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            A[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            A[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +262,29 @@ mod tests {
         let b = KeyPair::from_seed_name("node-a");
         assert_eq!(a.public, b.public);
         assert_eq!(a.node_id(), b.node_id());
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        // RFC 4648 vectors.
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn wireguard_keys_are_44_char_base64() {
+        // A 32-byte X25519 key renders to WireGuard's 44-char base64 form.
+        let kp = KeyPair::from_seed_name("wg-node");
+        let pk = kp.public.to_wireguard_key();
+        let sk = kp.secret.to_wireguard_key();
+        assert_eq!(pk.len(), 44);
+        assert!(pk.ends_with('='));
+        assert_eq!(sk.len(), 44);
+        // Stable: same identity → same WG key.
+        assert_eq!(pk, KeyPair::from_seed_name("wg-node").public.to_wireguard_key());
     }
 
     #[test]

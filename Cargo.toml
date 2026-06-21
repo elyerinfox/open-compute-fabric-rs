@@ -65,6 +65,7 @@ parking_lot = "0.12"
 anyhow = "1"
 redb = "2"
 snow = "0.10"
+zstd = "0.13"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand = "0.8"
 hex = "0.4"

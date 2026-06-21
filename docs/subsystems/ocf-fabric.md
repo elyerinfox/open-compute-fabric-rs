@@ -299,6 +299,94 @@ else silent `≥ suspect_timeout` while `Alive` → `Suspect`. A `heartbeat`
 arriving for a `Suspect` revives it to `Alive` (emitting `Recovered`); a
 heartbeat for a `Left` member is ignored.
 
+## Bulk streaming transfers
+
+The request/response RPC ([`NoiseTransport::request`]) is for control-plane
+messages and is capped at one 64 KB frame per call — unsuitable for multi-MB/GB
+data (VM-migration memory images, disk blobs). For those there is a **streaming
+path** that chunks a byte stream into pipelined Noise records:
+
+| Piece | Role |
+|-------|------|
+| `wire::send_stream(reader, compress)` | Reads the source in ≤`STREAM_CHUNK` (64 KB − 64) pieces, optionally **zstd-compresses** each, seals it as a Noise record, writes them **back-to-back without per-record flush or ack**, and ends with a sealed empty record (an *authenticated* EOF, so truncation is detected). |
+| `wire::recv_stream(writer, compress)` | Drains records into a sink until the empty EOF record, decompressing each when `compress` is set (must match the sender). |
+| `NoiseTransport::send_stream(node, reader, compress)` | Opens a **dedicated** encrypted connection (so a bulk transfer never blocks control RPC on the shared session) and pumps the stream. |
+| `FabricStreamServer::run(compress, sink)` | The receiving listener: per connection, handshake then drain records into a per-peer sink (a file, `tokio::io::sink`, a channel, …). |
+
+Because records flow back-to-back, throughput is bounded by the cipher and the
+link — **not** by round-trips. That's the difference between viable and unusable
+for large transfers: the serial RPC path is RTT-bound (one frame in flight), the
+stream path fills the pipe. **Compression** (zstd, per record, before sealing)
+trades CPU for far fewer encrypted and on-wire bytes — a large win for the
+realistic VM-migration case (memory images are full of zero/repeated pages).
+
+**Measured** (loopback, release, `examples/fabric_bench.rs`):
+
+| Path | Throughput |
+|------|-----------|
+| Serial 60 KB RPC | ~191 MB/s (and collapses toward 0 as real-network RTT grows) |
+| Stream, raw, 1 GiB | **~0.55 GB/s** — the ChaCha20-Poly1305 software ceiling |
+| Stream, zstd, 1 GiB sparse | **~2.0 GB/s** effective (≈3.7× — fewer bytes hit the cipher/wire) |
+
+The stream path is RTT-independent. Run it with:
+
+```
+cargo run -p ocf-fabric --release --example fabric_bench
+```
+
+## Topology intelligence: latency, reachability & routing
+
+The mesh is a flat full-mesh between *directly-dialable* nodes, but it is not
+blind to topology:
+
+**Measured latency.** Each node runs a control channel — a ping server plus a
+prober that periodically times a round-trip to every alive peer and records the
+result as `MemberState.rtt_ms`. This is a *real measured* RTT (not a static
+field), surfaced at `GET /api/v1/fabric/membership` and consumed by latency-aware
+routing and the load balancer's `Latency` policy.
+
+**Reachability.** A [`FabricNode`] carries a `Reachability`:
+
+| Value | Meaning |
+|-------|---------|
+| `Public` | Directly dialable from anywhere (default). |
+| `Private` | Behind NAT / no inbound — **not** directly dialable; reached via a relay. |
+| `Relay` | Public *and* willing to forward traffic for `Private` peers. |
+
+**Weighted path selection.** `plan_route` (`routing.rs`) chooses how to reach a
+target, weighed by measured RTT:
+
+```mermaid
+flowchart TD
+    A[plan_route to target] --> B{target directly dialable?}
+    B -->|Public / Relay| C[Direct: cost = RTT of target]
+    B -->|Private| D{any relay?}
+    D -->|yes| E[Relayed via lowest-RTT relay:<br/>cost = RTT of relay + penalty]
+    D -->|no| F[Unreachable]
+    C --> G{relay strictly cheaper?}
+    E --> G
+    G -->|no| C
+    G -->|yes| E
+```
+
+A direct path wins ties and is only beaten by a *strictly cheaper* relay, so a
+reachable peer is never relayed needlessly. For a `Private` peer the planner
+picks the **lowest-RTT relay** — that is the "fastest path" calculation, made
+meaningful precisely where it matters (NAT'd nodes and multi-route choices).
+`GET /api/v1/fabric/routes` shows the plan from this node to every peer.
+
+**Relay datapath.** `NoiseTransport::request_via_relay(relay, target, payload)`
+forwards a request to a `Private` target through a relay; the relay runs
+`forward_relayed` as its handler, dials the target, and returns the reply. (The
+relay is trusted fleet infrastructure; an additional inner seal would be needed
+for end-to-end confidentiality *from* the relay.)
+
+> Scope note: relaying assumes the relay can reach the target (e.g. the target is
+> private to the *origin's* network but routable from the relay's). A target
+> behind symmetric NAT reachable from *nowhere* inbound needs a held reverse
+> tunnel (the private node keeps an outbound connection to the relay open); that
+> persistent-tunnel variant is the next step on this foundation.
+
 ## Implementation detail
 
 ### Frame format

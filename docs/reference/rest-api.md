@@ -33,6 +33,7 @@ handler is a thin adapter that borrows one subsystem off the
 | `POST` | `/api/v1/workloads/:id/migrate` | Runtime | Request live migration of a workload |
 | `POST` | `/api/v1/workloads/:id/network` | Runtime | Attach a workload to a subnet (allocates an IP via IPAM) |
 | `DELETE` | `/api/v1/workloads/:id/network` | Runtime | Detach a workload from its subnet (releases its IP) |
+| `GET` | `/api/v1/workloads/:id/candidates` | Runtime | Nodes a workload can run on (scope + capability + capacity) |
 | `GET` | `/api/v1/networks/vpcs` | Network | Every VPC |
 | `GET` | `/api/v1/networks/subnets` | Network | Every subnet across every VPC |
 | `POST` | `/api/v1/networks/subnets/:id/egress` | Network | Set a subnet's outbound-internet (NAT) capability |
@@ -41,6 +42,8 @@ handler is a thin adapter that borrows one subsystem off the
 | `GET` | `/api/v1/metrics/host` | Monitoring | Aggregate host resource usage |
 | `GET` | `/api/v1/fabric/peers` | Fabric/Membership | Mesh peer records |
 | `GET` | `/api/v1/fabric/membership` | Fabric/Membership | Membership table (liveness per node) |
+| `GET` | `/api/v1/fabric/wireguard` | Fabric/Membership | Computed WireGuard underlay mesh (VXLAN rides it) |
+| `GET` | `/api/v1/fabric/routes` | Fabric/Membership | Planned route to each peer (direct vs relayed, RTT-weighed) |
 | `POST` | `/api/v1/fabric/machines/:id/heartbeat` | Fabric/Membership | Keep a node alive |
 | `POST` | `/api/v1/fabric/machines/:id/fail` | Fabric/Membership | Force a node dead, reschedule its HA workloads |
 | `GET` | `/api/v1/access/users` | Access/RBAC | Every RBAC user |
@@ -779,9 +782,11 @@ dialable mesh addresses; `last_seen` is an RFC 3339 timestamp.
 
 ### `GET /api/v1/fabric/membership`
 
-The membership table: one row per fleet member, with its liveness. `liveness` is
-a `snake_case` [`Liveness`](../subsystems/ocf-fabric.md) (`"alive"`,
-`"suspect"`, `"dead"`, `"left"`); `last_heartbeat` is an RFC 3339 timestamp.
+The membership table: one row per fleet member. `liveness` is a `snake_case`
+[`Liveness`](../subsystems/ocf-fabric.md) (`"alive"`, `"suspect"`, `"dead"`,
+`"left"`); `reachability` is `"public"`/`"private"`/`"relay"`; `rtt_ms` is the
+last **measured** round-trip latency to the peer (`null` until probed);
+`last_heartbeat` is an RFC 3339 timestamp.
 
 **Response**
 
@@ -791,15 +796,80 @@ a `snake_case` [`Liveness`](../subsystems/ocf-fabric.md) (`"alive"`,
     "node_id": "node-1",
     "machine_id": "node-1",
     "liveness": "alive",
+    "reachability": "relay",
+    "rtt_ms": 0.42,
     "last_heartbeat": "2026-06-20T12:00:00+00:00"
   },
   {
-    "node_id": "node-3",
-    "machine_id": "node-3",
-    "liveness": "suspect",
+    "node_id": "node-2",
+    "machine_id": "node-2",
+    "liveness": "alive",
+    "reachability": "private",
+    "rtt_ms": null,
     "last_heartbeat": "2026-06-20T11:59:48+00:00"
   }
 ]
+```
+
+### `GET /api/v1/fabric/routes`
+
+The planned route from this node to every peer, weighed by measured RTT.
+`route` is `"direct"` (peer dialable), `"relayed"` (peer is `private`, reached
+through `via`), or `"unreachable"`; `cost_ms` is the estimated path cost.
+
+**Response**
+
+```json
+[
+  { "target": "node-1", "machine_id": "node-1", "reachability": "relay",
+    "route": "direct", "via": null, "cost_ms": 0.42 },
+  { "target": "node-2", "machine_id": "node-2", "reachability": "private",
+    "route": "relayed", "via": "node-1", "cost_ms": 50.42 }
+]
+```
+
+### `GET /api/v1/workloads/:id/candidates`
+
+The machines a workload can be (re)scheduled onto, given its `node_selector`
+(required node capabilities), placement scope, and capacity.
+
+**Response**
+
+```json
+{
+  "workload": "gpu-job",
+  "node_selector": { "gpu": "true" },
+  "candidates": [ { "id": "…", "name": "node-3" } ]
+}
+```
+
+### `GET /api/v1/fabric/wireguard`
+
+The computed **WireGuard underlay mesh**: this node and its peers, with their
+WireGuard public keys (base64 Curve25519, derived from each node's fabric
+identity) and underlay endpoints. The VXLAN overlay's VTEPs point at these
+WireGuard addresses, so cross-host workload traffic is encrypted; tenant
+isolation stays in the VXLAN VNIs / ACLs (see
+[ocf-network → WireGuard underlay](../subsystems/ocf-network.md#wireguard-underlay--encrypting-the-overlay)).
+
+**Response**
+
+```json
+{
+  "iface": "wg-ocf",
+  "node": "node-1",
+  "node_ip": "10.255.0.1",
+  "public_key": "0SqA+ka2sZVRFmhvkj0Zb9sPAg3k5G6YKkdKeV1UAjE=",
+  "vxlan_rides_wireguard": true,
+  "peers": [
+    {
+      "name": "node-2",
+      "wg_ip": "10.255.0.2",
+      "endpoint": "10.0.0.2:51820",
+      "public_key": "nOjMzMr58+b6g8QE9Qj82w4IaoEmW5QAGI8CiRUHbF0="
+    }
+  ]
+}
 ```
 
 ### `POST /api/v1/fabric/machines/:id/heartbeat`

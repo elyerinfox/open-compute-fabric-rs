@@ -22,8 +22,19 @@ fn noise_err(ctx: &str, e: impl std::fmt::Display) -> Error {
     Error::provider("noise", format!("{ctx}: {e}"))
 }
 
-/// Write a single length-prefixed frame (`u16` big-endian length + bytes).
+/// Write a single length-prefixed frame (`u16` big-endian length + bytes) and
+/// flush it — used for request/response and the handshake, where the peer must
+/// see the message immediately.
 pub async fn write_frame(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+    write_frame_pipelined(stream, data).await?;
+    stream.flush().await.map_err(|e| noise_err("flush", e))?;
+    Ok(())
+}
+
+/// Write a length-prefixed frame **without flushing**, so back-to-back records
+/// pipeline through the socket instead of paying a syscall per record. The
+/// caller flushes once at the end of the stream.
+async fn write_frame_pipelined(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
     if data.len() > MAX_NOISE_MSG {
         return Err(Error::invalid("noise frame exceeds 65535 bytes"));
     }
@@ -35,7 +46,6 @@ pub async fn write_frame(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
         .write_all(data)
         .await
         .map_err(|e| noise_err("write body", e))?;
-    stream.flush().await.map_err(|e| noise_err("flush", e))?;
     Ok(())
 }
 
@@ -141,4 +151,106 @@ pub async fn recv_opened(
         .map_err(|e| noise_err("open", e))?;
     buf.truncate(len);
     Ok(buf)
+}
+
+/// Plaintext bytes carried per streamed record. Leaves headroom under the 65535
+/// Noise message limit for the 16-byte AEAD tag.
+pub const STREAM_CHUNK: usize = 64 * 1024 - 64;
+
+/// zstd level for streamed records. Level 3 is the zstd default: a strong
+/// speed/ratio balance, and fast enough not to bottleneck a multi-hundred-MB/s
+/// transfer.
+const ZSTD_LEVEL: i32 = 3;
+
+/// Largest plaintext a streamed record can expand to on the receiver — the chunk
+/// size, since the sender never reads more than [`STREAM_CHUNK`] per record.
+const STREAM_DECOMP_CAP: usize = STREAM_CHUNK;
+
+/// Stream the whole of `reader` to the peer as a sequence of sealed records,
+/// **pipelined** (no per-record round-trip, no per-record flush), terminated by
+/// a sealed empty record (an authenticated end-of-stream marker, so truncation
+/// can't go unnoticed). When `compress` is set each record's plaintext is
+/// zstd-compressed *before* it is sealed — so the cipher and the wire carry the
+/// compressed bytes. Returns the number of **uncompressed** bytes sent.
+///
+/// This removes the request/response RTT bound: records flow back-to-back at the
+/// rate TCP and the cipher allow, which (with compression) is what makes
+/// multi-GB transfers — a VM migration memory image, a disk blob — practical over
+/// the encrypted fabric. The receiver must use [`recv_stream`] with the same
+/// `compress` flag.
+pub async fn send_stream<R>(
+    stream: &mut TcpStream,
+    transport: &mut TransportState,
+    reader: &mut R,
+    compress: bool,
+) -> Result<u64>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut plain = vec![0u8; STREAM_CHUNK];
+    // Sealed buffer holds the AEAD output of a record body; a compressed body can
+    // be at most a small header larger than the plaintext, so size for the worst.
+    let mut sealed = vec![0u8; STREAM_CHUNK + 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader
+            .read(&mut plain)
+            .await
+            .map_err(|e| noise_err("stream read", e))?;
+        if n == 0 {
+            break;
+        }
+        let body = if compress {
+            zstd::bulk::compress(&plain[..n], ZSTD_LEVEL)
+                .map_err(|e| noise_err("zstd compress", e))?
+        } else {
+            plain[..n].to_vec()
+        };
+        let len = transport
+            .write_message(&body, &mut sealed)
+            .map_err(|e| noise_err("seal record", e))?;
+        write_frame_pipelined(stream, &sealed[..len]).await?;
+        total += n as u64;
+    }
+    // Empty sealed record = authenticated end-of-stream (never compressed).
+    let len = transport
+        .write_message(&[], &mut sealed)
+        .map_err(|e| noise_err("seal eof", e))?;
+    write_frame_pipelined(stream, &sealed[..len]).await?;
+    stream.flush().await.map_err(|e| noise_err("flush", e))?;
+    Ok(total)
+}
+
+/// Drain a streamed sequence of sealed records into `writer` until the empty
+/// end-of-stream record, decompressing each record when `compress` is set (it
+/// must match the sender). Returns the number of uncompressed bytes received.
+pub async fn recv_stream<W>(
+    stream: &mut TcpStream,
+    transport: &mut TransportState,
+    writer: &mut W,
+    compress: bool,
+) -> Result<u64>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut total: u64 = 0;
+    loop {
+        let record = recv_opened(stream, transport).await?;
+        if record.is_empty() {
+            break; // end-of-stream marker
+        }
+        let body = if compress {
+            zstd::bulk::decompress(&record, STREAM_DECOMP_CAP)
+                .map_err(|e| noise_err("zstd decompress", e))?
+        } else {
+            record
+        };
+        writer
+            .write_all(&body)
+            .await
+            .map_err(|e| noise_err("stream write", e))?;
+        total += body.len() as u64;
+    }
+    writer.flush().await.map_err(|e| noise_err("stream flush", e))?;
+    Ok(total)
 }

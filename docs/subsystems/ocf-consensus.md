@@ -130,8 +130,11 @@ state machine holds the durable `StateStore` it applies into.
 every collection the SM has written (tracked in `sm_collections`, since the store
 only supports per-collection `list`), serializes a `SnapshotPayload`
 (`last_applied`, `last_membership`, and `collection -> (key -> value)`) to JSON,
-and retains it. `install_snapshot` clears the known collections then loads the
-payload's, so a lagging or freshly-joined node is caught up in one shot.
+**zstd-compresses it**, and retains it. `install_snapshot` inflates and loads the
+payload, so a lagging or freshly-joined node is caught up in one shot. The
+snapshot is shipped whole to that node over the encrypted fabric, so compressing
+the (highly compressible JSON) state shrinks the catch-up transfer; a test
+asserts the snapshot is a real zstd frame and round-trips through `install`.
 
 ## Replication detail — how a write flows
 

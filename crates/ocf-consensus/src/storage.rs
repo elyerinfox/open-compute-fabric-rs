@@ -71,6 +71,9 @@ mod parking_lot_shim {
 
 type NodeId = u64;
 
+/// zstd level for Raft snapshots (shipped whole to lagging followers).
+const SNAPSHOT_ZSTD_LEVEL: i32 = 3;
+
 /// The serialized form of a snapshot: every `(collection, key, value)` triple in
 /// the state-machine store, plus the metadata openraft needs to place it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,7 +340,11 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
         let (payload, meta, bytes) = {
             let mut inner = self.inner.lock();
             let payload = self.build_payload(&inner)?;
-            let bytes = serde_json::to_vec(&payload)
+            let json = serde_json::to_vec(&payload)
+                .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
+            // Compress the snapshot: it is shipped whole to lagging followers over
+            // the fabric, and control-plane state (mostly JSON) compresses well.
+            let bytes = zstd::stream::encode_all(&json[..], SNAPSHOT_ZSTD_LEVEL)
                 .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
 
             inner.snapshot_idx += 1;
@@ -423,7 +430,10 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
-        let payload: SnapshotPayload = serde_json::from_slice(&bytes)
+        // Snapshots are zstd-compressed (see `build_snapshot`); inflate first.
+        let json = zstd::stream::decode_all(&bytes[..])
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        let payload: SnapshotPayload = serde_json::from_slice(&json)
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
 
         let mut inner = self.inner.lock();
@@ -446,5 +456,33 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             })),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ocf_store::MemoryStateStore;
+    use openraft::storage::RaftStateMachine;
+    use openraft::RaftSnapshotBuilder;
+
+    #[tokio::test]
+    async fn snapshot_is_zstd_and_installs_back() {
+        let (_log, mut sm) = new_storage(Arc::new(MemoryStateStore::new()));
+        let snap = sm.build_snapshot().await.expect("build snapshot");
+
+        // The snapshot data is a real zstd frame (magic 0x28 B5 2F FD).
+        let bytes = snap.snapshot.get_ref();
+        assert!(
+            bytes.len() >= 4 && bytes[..4] == [0x28, 0xB5, 0x2F, 0xFD],
+            "snapshot should be zstd-compressed"
+        );
+
+        // A fresh state machine installs it (decompress + deserialize) cleanly —
+        // proving the compress/decompress round-trips through the real methods.
+        let (_log2, mut sm2) = new_storage(Arc::new(MemoryStateStore::new()));
+        sm2.install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .expect("install compressed snapshot");
     }
 }

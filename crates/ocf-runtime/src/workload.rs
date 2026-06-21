@@ -57,6 +57,12 @@ pub struct Workload {
     /// Environment variables injected into the workload.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Required node capabilities: a label selector a machine's
+    /// [`Metadata::labels`] must satisfy for the workload to be (re)scheduled
+    /// onto it. Empty = no capability requirement. Composed with `placement`
+    /// (scope) and capacity during placement.
+    #[serde(default)]
+    pub node_selector: BTreeMap<String, String>,
     /// Optional attachment to an SDN subnet. `None` means the workload uses the
     /// backend's default networking; `Some` places it in a subnet and declares
     /// whether it gets outbound internet access.
@@ -120,6 +126,7 @@ impl Workload {
             highly_available: false,
             placement: None,
             env: BTreeMap::new(),
+            node_selector: BTreeMap::new(),
             network: None,
         }
     }
@@ -136,6 +143,7 @@ impl Workload {
             highly_available: false,
             placement: None,
             env: BTreeMap::new(),
+            node_selector: BTreeMap::new(),
             network: None,
         }
     }
@@ -167,6 +175,13 @@ impl Workload {
     /// Builder: attach the workload to an SDN subnet.
     pub fn with_network(mut self, attachment: NetworkAttachment) -> Self {
         self.network = Some(attachment);
+        self
+    }
+
+    /// Builder: require a node capability (label `key == value`) for placement.
+    /// Chainable to require several. A machine must match **all** of them.
+    pub fn requires(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.node_selector.insert(key.into(), value.into());
         self
     }
 

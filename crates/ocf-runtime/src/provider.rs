@@ -44,6 +44,15 @@ pub trait RuntimeProvider: Provider {
     /// List every workload this backend currently manages.
     async fn list(&self) -> Result<Vec<Workload>>;
 
+    /// The host PID of a workload, used to find its network namespace when
+    /// splicing it onto the SDN overlay. Container backends return the
+    /// container's PID; backends without a host netns (VMs) return `None`
+    /// (the default).
+    async fn host_pid(&self, id: &Id) -> Result<Option<u32>> {
+        let _ = id;
+        Ok(None)
+    }
+
     /// Capture a live memory checkpoint of a running workload.
     ///
     /// Non-migratable backends inherit the default, which refuses the

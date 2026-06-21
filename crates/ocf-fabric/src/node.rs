@@ -4,12 +4,30 @@ use crate::crypto::{KeyPair, NodeId, PublicKey};
 use chrono::{DateTime, Utc};
 use ocf_core::prelude::*;
 
+/// How a node can be reached on the fabric.
+///
+/// This is what lets the mesh handle members that aren't publicly addressable:
+/// a `Private` node can make outbound connections but can't be dialed directly,
+/// so traffic to it is routed through a `Relay`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reachability {
+    /// Directly dialable from anywhere in the fleet (a public/routable endpoint).
+    #[default]
+    Public,
+    /// Behind NAT / no inbound: reachable only via a relay (or its own outbound
+    /// connections). Not directly dialable.
+    Private,
+    /// Directly dialable *and* willing to forward traffic for `Private` peers.
+    Relay,
+}
+
 /// A node advertised in the fabric mesh.
 ///
 /// This is the membership record a peer needs in order to reach another node:
 /// its mesh-level [`NodeId`], the (optional) fleet [`Id`] of the backing
-/// machine, its public key, the endpoints it can be dialed on, and when it was
-/// last seen alive.
+/// machine, its public key, the endpoints it can be dialed on, how it can be
+/// reached, and when it was last seen alive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FabricNode {
     pub node_id: NodeId,
@@ -18,6 +36,9 @@ pub struct FabricNode {
     pub public_key: PublicKey,
     /// Dialable mesh endpoints, e.g. `"10.0.0.4:51820"`.
     pub endpoints: Vec<String>,
+    /// How this node can be reached (direct vs relay-only). Defaults to `Public`.
+    #[serde(default)]
+    pub reachability: Reachability,
     pub last_seen: DateTime<Utc>,
 }
 
@@ -33,6 +54,7 @@ impl FabricNode {
             machine_id: None,
             public_key,
             endpoints,
+            reachability: Reachability::Public,
             last_seen: Utc::now(),
         }
     }
@@ -47,6 +69,22 @@ impl FabricNode {
     pub fn with_machine(mut self, machine_id: Id) -> Self {
         self.machine_id = Some(machine_id);
         self
+    }
+
+    /// Set how this node is reachable (direct vs relay-only).
+    pub fn with_reachability(mut self, reachability: Reachability) -> Self {
+        self.reachability = reachability;
+        self
+    }
+
+    /// Whether this node can be dialed directly (`Public` or `Relay`).
+    pub fn is_directly_dialable(&self) -> bool {
+        !matches!(self.reachability, Reachability::Private)
+    }
+
+    /// Whether this node can relay traffic for others.
+    pub fn is_relay(&self) -> bool {
+        matches!(self.reachability, Reachability::Relay)
     }
 
     /// Refresh the liveness timestamp to now.

@@ -90,7 +90,7 @@ fn is_idempotent_stderr(stderr: &str) -> bool {
 /// Run `cmd args...`, capturing output. Success (exit 0) returns `Ok`; an
 /// "already exists" failure is treated as success for idempotency; any other
 /// failure becomes [`Error::Provider`] tagged with `cmd` and the stderr text.
-async fn run(cmd: &str, args: &[&str]) -> Result<()> {
+pub(crate) async fn run(cmd: &str, args: &[&str]) -> Result<()> {
     let output = Command::new(cmd)
         .args(args)
         .stdin(Stdio::null())
