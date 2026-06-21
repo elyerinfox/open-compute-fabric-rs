@@ -157,6 +157,13 @@ Running it for real.
 | [Deployment](operations/deployment.md) | Multi-node clusters, seeds, the data directory |
 | [Security](operations/security.md) | Crypto, authentication, secrets, TLS |
 
+### 🗒️ [Changelog](changelog/)
+What shipped, by date — a heavy, cross-referenced record of each change.
+
+| Entry | Highlights |
+|-------|-----------|
+| [2026-06-21](changelog/2026-06-21.md) | SDN egress/IPAM/VXLAN, fleet health, cross-OS packages, streaming + zstd, WireGuard underlays (3 planes), capability placement, latency/reachability/routing, LB ↔ workload association |
+
 ## Conventions used in these docs
 
 - **Mermaid diagrams** render natively on GitHub; every architectural diagram in
