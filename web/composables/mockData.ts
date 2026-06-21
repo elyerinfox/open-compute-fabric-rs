@@ -13,6 +13,7 @@ import type {
   User,
   Role,
   HealthReport,
+  HealthFinding,
 } from './types'
 
 const GiB = 1024 * 1024 * 1024
@@ -441,5 +442,65 @@ export const mockRoles: Role[] = [
   {
     metadata: { id: 'r-003', name: 'Operator' },
     permissions: ['workload:create', 'workload:migrate', 'lb:manage', 'vpc:manage'],
+  },
+]
+
+export const mockHealthFindings: HealthFinding[] = [
+  {
+    id: 'ip-forwarding:node-local:disabled',
+    check: 'ip-forwarding',
+    category: 'kernel',
+    machine_id: 'node-local',
+    severity: 'warning',
+    title: 'IP forwarding not enabled on kernel',
+    detail:
+      'net.ipv4.ip_forward is 0. Without IP forwarding the node cannot route packets between fabric interfaces, which breaks overlay networking and load-balancer data paths.',
+    fixes: [
+      {
+        id: 'enable-ip-forwarding',
+        label: 'Enable IP forwarding',
+        description: 'Sets net.ipv4.ip_forward=1 via sysctl and persists it to /etc/sysctl.d.',
+        requires_root: true,
+      },
+    ],
+    detected_at: '2026-06-21T18:45:28Z',
+  },
+  {
+    id: 'netfilter-nftables:node-local:disabled',
+    check: 'netfilter-nftables',
+    category: 'network',
+    machine_id: 'node-local',
+    severity: 'warning',
+    title: 'Netfilter (nf_tables) not enabled on kernel',
+    detail:
+      'The nf_tables module is not loaded. The fabric uses nftables to program NAT and security-group rules; without it firewalling and service routing will not take effect.',
+    fixes: [
+      {
+        id: 'load-nf-tables',
+        label: 'Load nf_tables module',
+        description: 'Runs modprobe nf_tables and adds it to /etc/modules-load.d so it persists across reboots.',
+        requires_root: true,
+      },
+    ],
+    detected_at: '2026-06-21T18:45:28Z',
+  },
+  {
+    id: 'docker-experimental:node-local:disabled',
+    check: 'docker-experimental',
+    category: 'runtime',
+    machine_id: 'node-local',
+    severity: 'info',
+    title: 'Docker experimental features not enabled',
+    detail:
+      'The Docker daemon is running without experimental features. Some fabric runtime integrations (e.g. checkpoint/restore based live migration) rely on experimental APIs.',
+    fixes: [
+      {
+        id: 'enable-docker-experimental',
+        label: 'Enable Docker experimental',
+        description: 'Sets "experimental": true in /etc/docker/daemon.json and restarts the daemon.',
+        requires_root: true,
+      },
+    ],
+    detected_at: '2026-06-21T18:45:28Z',
   },
 ]

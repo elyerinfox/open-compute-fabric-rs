@@ -33,8 +33,13 @@ pub fn api_router(controller: Arc<FabricController>) -> Router {
         .route("/api/v1/runtimes", get(runtimes))
         .route("/api/v1/workloads", get(workloads))
         .route("/api/v1/workloads/:id/migrate", post(migrate_workload))
+        .route(
+            "/api/v1/workloads/:id/network",
+            post(attach_workload).delete(detach_workload),
+        )
         .route("/api/v1/networks/vpcs", get(vpcs))
         .route("/api/v1/networks/subnets", get(subnets))
+        .route("/api/v1/networks/subnets/:id/egress", post(set_subnet_egress))
         .route("/api/v1/loadbalancers", get(loadbalancers))
         .route("/api/v1/disks", get(disks))
         .route("/api/v1/metrics/host", get(host_metrics))
@@ -43,6 +48,9 @@ pub fn api_router(controller: Arc<FabricController>) -> Router {
         .route("/api/v1/fabric/machines/:id/heartbeat", post(heartbeat_machine))
         .route("/api/v1/fabric/machines/:id/fail", post(fail_machine))
         .route("/api/v1/admin/persist", post(persist_state))
+        .route("/api/v1/health/findings", get(health_findings))
+        .route("/api/v1/health/fix", post(health_fix))
+        .route("/api/v1/platform", get(platform_status))
         .route("/api/v1/access/users", get(users))
         .route("/api/v1/access/roles", get(roles))
         .route("/api/v1/access/groups", get(groups))
@@ -93,6 +101,8 @@ async fn providers(State(c): Ctrl) -> Json<Vec<ProviderGroup>> {
         group("IpmiController", c.inventory_controllers.ipmi.all()),
         group("CertificateProvider", c.cert_providers.all()),
         group("DnsProvider", c.dns_providers.all()),
+        group("HealthCheck", c.health.checks().all()),
+        group("PackageManager", c.platform.managers().all()),
     ])
 }
 
@@ -157,6 +167,34 @@ async fn migrate_workload(State(c): Ctrl, Path(id): Path<String>) -> ApiResult<J
     Err(Error::not_found(format!("workload {wid}")).into())
 }
 
+/// `POST /api/v1/workloads/:id/network` — attach a workload to a subnet.
+/// Body: `{ "subnet_id": "...", "egress": false }`. Allocates an address (IPAM),
+/// records the binding, and re-programs the subnet's egress allow-list.
+async fn attach_workload(
+    State(c): Ctrl,
+    Path(id): Path<String>,
+    Json(body): Json<AttachBody>,
+) -> ApiResult<Json<ocf_runtime::NetworkAttachment>> {
+    let att = c
+        .attach_workload(&Id::from(id), &Id::from(body.subnet_id), body.egress)
+        .await?;
+    Ok(Json(att))
+}
+
+/// `DELETE /api/v1/workloads/:id/network` — detach a workload from its subnet,
+/// releasing its address and re-programming egress.
+async fn detach_workload(State(c): Ctrl, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    c.detach_workload(&Id::from(id)).await?;
+    Ok(Json(json!({ "detached": true })))
+}
+
+#[derive(serde::Deserialize)]
+struct AttachBody {
+    subnet_id: String,
+    #[serde(default)]
+    egress: bool,
+}
+
 async fn vpcs(State(c): Ctrl) -> ApiResult<Json<Vec<ocf_network::Vpc>>> {
     Ok(Json(c.network.list_vpcs().await?))
 }
@@ -167,6 +205,27 @@ async fn subnets(State(c): Ctrl) -> ApiResult<Json<Vec<ocf_network::Subnet>>> {
         out.extend(c.network.list_subnets(&vpc.metadata.id).await?);
     }
     Ok(Json(out))
+}
+
+/// `POST /api/v1/networks/subnets/:id/egress` — set a subnet's outbound internet
+/// capability. Body: `{ "mode": "nat" | "isolated" }`. Re-programs the egress
+/// data path for the opted-in workloads and persists.
+async fn set_subnet_egress(
+    State(c): Ctrl,
+    Path(id): Path<String>,
+    Json(body): Json<EgressBody>,
+) -> ApiResult<Json<ocf_network::Subnet>> {
+    let mode = match body.mode.to_ascii_lowercase().as_str() {
+        "nat" => ocf_network::EgressMode::Nat,
+        "isolated" => ocf_network::EgressMode::Isolated,
+        other => return Err(Error::invalid(format!("unknown egress mode `{other}`")).into()),
+    };
+    Ok(Json(c.set_subnet_egress(&Id::from(id), mode).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct EgressBody {
+    mode: String,
 }
 
 async fn loadbalancers(State(c): Ctrl) -> ApiResult<Json<Vec<ocf_loadbalancer::LoadBalancer>>> {
@@ -206,6 +265,35 @@ async fn fail_machine(State(c): Ctrl, Path(id): Path<String>) -> ApiResult<Json<
 async fn persist_state(State(c): Ctrl) -> ApiResult<Json<Value>> {
     c.persist().await?;
     Ok(Json(json!({ "persisted": true })))
+}
+
+/// `GET /api/v1/health/findings` — run every health check for this node and
+/// return the findings (problems + the fix actions the user can press).
+async fn health_findings(State(c): Ctrl) -> Json<Vec<ocf_health::HealthFinding>> {
+    Json(c.health.run(&c.node_machine_id()).await)
+}
+
+/// `POST /api/v1/health/fix` — apply a finding's fix. Body:
+/// `{ "check": "ip-forwarding", "fix": "enable-ipv4-forwarding" }`.
+async fn health_fix(State(c): Ctrl, Json(body): Json<HealthFixBody>) -> ApiResult<Json<Value>> {
+    let outcome = c
+        .health
+        .apply_fix(&body.check, &body.fix, &c.node_machine_id())
+        .await?;
+    Ok(Json(json!({ "applied": true, "outcome": outcome })))
+}
+
+#[derive(serde::Deserialize)]
+struct HealthFixBody {
+    check: String,
+    fix: String,
+}
+
+/// `GET /api/v1/platform` — the detected host OS, the selected package manager,
+/// and per-capability readiness (which required tools are present, and the
+/// package that would install each missing one).
+async fn platform_status(State(c): Ctrl) -> Json<ocf_platform::PlatformStatus> {
+    Json(c.platform.status(&ocf_platform::builtin_capabilities()))
 }
 
 async fn users(State(c): Ctrl) -> Json<Vec<ocf_authz::User>> {

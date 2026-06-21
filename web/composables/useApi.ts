@@ -10,6 +10,7 @@
 
 import type {
   HealthReport,
+  HealthFinding,
   TopologyNode,
   MachineDetail,
   Workload,
@@ -24,6 +25,7 @@ import type {
 
 import {
   mockHealth,
+  mockHealthFindings,
   mockTopology,
   mockWorkloads,
   mockVpcs,
@@ -173,6 +175,35 @@ export function useApi() {
     /** GET /api/v1/health */
     getHealth(): Promise<ApiResult<HealthReport>> {
       return getOrMock('/health', mockHealth)
+    },
+
+    /** GET /api/v1/health/findings — fleet-health checks for this node. */
+    getHealthFindings(): Promise<ApiResult<HealthFinding[]>> {
+      return getOrMock('/health/findings', mockHealthFindings)
+    },
+
+    /**
+     * POST /api/v1/health/fix with body `{ check, fix }`.
+     * Applies a finding's remediation. When the backend is unreachable, reports
+     * a mock failure so the UI can surface "(backend unavailable)" rather than
+     * implying the fix ran.
+     */
+    async applyHealthFix(
+      check: string,
+      fix: string,
+    ): Promise<ApiResult<{ applied: boolean; outcome: string }>> {
+      try {
+        const data = await $fetch<{ applied: boolean; outcome: string }>('/health/fix', {
+          baseURL,
+          method: 'POST',
+          body: { check, fix },
+          timeout: 4000,
+          retry: 0,
+        })
+        return { data, source: 'live' }
+      } catch {
+        return { data: { applied: false, outcome: '(backend unavailable)' }, source: 'mock' }
+      }
     },
 
     /** GET /api/v1/topology/tree — adapts the API's `{ regions: [...] }` shape. */

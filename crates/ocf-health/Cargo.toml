@@ -1,0 +1,17 @@
+[package]
+name = "ocf-health"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Modular fleet-health checks: each node signals findings (kernel/runtime/network) with user-pressable fix actions."
+
+[dependencies]
+ocf-core.workspace = true
+ocf-platform.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tokio.workspace = true

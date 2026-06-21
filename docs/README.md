@@ -33,7 +33,7 @@ flowchart TD
     end
 
     subgraph SUB["subsystems/"]
-        S1[ocf-core ... ocfd<br/>16 crate docs]
+        S1[ocf-core ... ocfd<br/>18 crate docs]
     end
 
     subgraph REF["reference/"]
@@ -115,6 +115,8 @@ Granular, per-crate reference. Each crate is one document.
 | [ocf-loadbalancer](subsystems/ocf-loadbalancer.md) | TCP/ALB, TLS (ACME), DDNS |
 | [ocf-store](subsystems/ocf-store.md) | Durable key/value state store |
 | [ocf-consensus](subsystems/ocf-consensus.md) | Raft-replicated control plane |
+| [ocf-health](subsystems/ocf-health.md) | Modular fleet-health checks + fixes |
+| [ocf-platform](subsystems/ocf-platform.md) | OS detection + cross-OS package managers |
 | [ocf-api](subsystems/ocf-api.md) | REST API + controller wiring |
 | [ocfd](subsystems/ocfd.md) | The monolithic daemon binary |
 

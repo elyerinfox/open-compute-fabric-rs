@@ -21,6 +21,8 @@ ocf-network.workspace = true
 ocf-loadbalancer.workspace = true
 ocf-store.workspace = true
 ocf-consensus.workspace = true
+ocf-health.workspace = true
+ocf-platform.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
@@ -30,3 +32,4 @@ axum.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 chrono.workspace = true
+parking_lot.workspace = true

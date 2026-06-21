@@ -59,8 +59,9 @@ Constructor: `Vpc::new(name, cidr, vni)`.
 | `vpc_id` | `Id` | owning VPC |
 | `cidr` | `String` | range, e.g. `"10.0.1.0/24"` |
 | `netns` | `String` | Linux network namespace hosting the subnet's dataplane |
+| `egress` | `EgressMode` | outbound internet capability (`Isolated` default, or `Nat`) — see [Egress](#egress-outbound-internet--nat) |
 
-Constructor: `Subnet::new(vpc_id, name, cidr, netns)`.
+Constructor: `Subnet::new(vpc_id, name, cidr, netns)` (egress defaults to `Isolated`); builder `.with_egress(EgressMode::Nat)`.
 
 ### `Route` — a static route for a subnet (no `Metadata`)
 
@@ -128,12 +129,25 @@ pub trait NetworkBackend: Provider {
     async fn apply_subnet(&self, subnet: &Subnet) -> Result<()>;
     async fn apply_route(&self, route: &Route) -> Result<()>;
     async fn apply_policy(&self, policy: &FirewallPolicy) -> Result<()>;
+
+    /// Program (or tear down) a subnet's egress NAT data path. Default no-op.
+    async fn apply_egress(&self, subnet: &Subnet, allowed_addresses: &[String]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Program a VPC's remote VXLAN VTEP peers (the other nodes' underlay
+    /// addresses) so the overlay is multi-host. Default no-op.
+    async fn apply_vpc_peers(&self, vpc: &Vpc, peer_vteps: &[String]) -> Result<()> {
+        Ok(())
+    }
 }
 ```
 
 Each method is **idempotent by contract**: applying the same resource twice
 converges to the same dataplane state. Backends extend `ocf_core::Provider` so
-they register by name.
+they register by name. `apply_egress` has a default no-op body so backends that
+don't provide host NAT compose unchanged — both `LinuxNetnsBackend` and
+`OvsBackend` override it (see [Egress](#egress-outbound-internet--nat)).
 
 ### Shared command helpers (`backend.rs`)
 
@@ -290,13 +304,177 @@ sequenceDiagram
     Note over NC,B2: first backend error aborts<br/>and is returned to caller
 ```
 
+> **Resilience note.** `create_vpc` and `create_subnet` **record desired state
+> centrally first**, then program the dataplane best-effort: a host (or the
+> control node itself, on a non-Linux box) that lacks `iproute2`/`nft`/OVS logs a
+> warning instead of failing the API call, and converges when its backend can
+> program. This mirrors the runtime/disk graceful-degradation pattern.
+
+## Egress (outbound internet / NAT)
+
+Outbound internet access is expressed in two layers and realized as distributed
+source-NAT. Inbound connections are **not** handled here — those are the
+[load balancer's](ocf-loadbalancer.md) responsibility.
+
+### The two-layer model
+
+| Layer | Where | Meaning |
+|-------|-------|---------|
+| **Capability** | `Subnet.egress: EgressMode` | `Isolated` (internal-only, default) or `Nat` (public subnet with internet egress). |
+| **Opt-in** | `Workload.network.egress: bool` ([`ocf-runtime`](ocf-runtime.md)) | A workload reaches the internet only when its subnet is `Nat` **and** it opted in. |
+
+`EgressMode` is a serde `snake_case` enum (`isolated` / `nat`) with
+`provides_egress() -> bool`.
+
+### The data path (`LinuxNetnsBackend` / `OvsBackend`)
+
+`apply_egress(subnet, allowed_addresses)` programs a host's egress via a shared
+`program_host_egress` helper (NAT is a host-netfilter concern, identical whether
+the L2 dataplane is a Linux bridge or OVS). When `subnet.egress == Nat`:
+
+1. **Enable forwarding** — writes `1` to `/proc/sys/net/ipv4/ip_forward` (no-op
+   if already on).
+2. **Resolve the uplink** — `ip route show default` → the `dev <iface>` of the
+   default route (`parse_default_uplink`).
+3. **Install an `inet ocf_egr_<id>` table** atomically via `nft -f -` with two
+   chains:
+   - a **forward filter** that accepts established/related return traffic and
+     each opted-in `allowed` source address, then **drops** the rest of the
+     subnet CIDR (this is the opt-in enforcement: default-deny);
+   - a **postrouting NAT** chain that masquerades the subnet CIDR out the uplink.
+
+When `subnet.egress == Isolated`, the table is removed.
+
+```mermaid
+flowchart LR
+    wl["Workload in 10.0.1.0/24<br/>(opted in: addr 10.0.1.5)"] --> fwd{"forward filter<br/>(ocf_egr table)"}
+    other["Workload NOT opted in"] --> fwd
+    fwd -->|"ip saddr 10.0.1.5 accept"| post["postrouting NAT"]
+    fwd -->|"ip saddr 10.0.1.0/24 drop"| x["dropped"]
+    post -->|"masquerade oif eth0"| net["uplink → internet"]
+    lb["ocf-loadbalancer<br/>(ingress, separate)"] -.inbound.-> wl
+```
+
+The generated nft (two opted-in workloads, uplink `eth0`):
+
+```
+table inet ocf_egr_<id> {
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    ct state established,related accept
+    ip saddr 10.0.1.5 accept
+    ip saddr 10.0.1.6 accept
+    ip saddr 10.0.1.0/24 drop
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr 10.0.1.0/24 oifname "eth0" masquerade
+  }
+}
+```
+
+### Controller surface
+
+| Method | Behavior |
+|--------|----------|
+| `create_subnet` | Programs egress automatically when the subnet is `Nat` (empty allow-list initially). |
+| `set_subnet_egress(id, mode, allowed)` | Change a subnet's capability and re-program; capability recorded even if programming fails. |
+| `refresh_subnet_egress(id, allowed)` | Re-program with the current opted-in workload addresses (called when attachments change). |
+
+At the API level, [`ocf-api`](ocf-api.md)'s `FabricController::set_subnet_egress`
+gathers the opted-in addresses (`subnet_egress_allowed`) from attached workloads,
+re-programs, and persists. Driven by `POST /api/v1/networks/subnets/:id/egress`
+(see [REST API](../reference/rest-api.md#post-apiv1networkssubnetsidegress)).
+
+> **Distributed masquerade** (the chosen NAT topology): each host masquerades its
+> local workloads out its own uplink. Simple and works today; the trade-off is
+> that a workload's egress source IP is whatever host it currently runs on.
+
+## IPAM — per-subnet address allocation
+
+Each subnet owns a `SubnetAllocator` (`ipam.rs`) that hands out host
+addresses from the subnet CIDR, **skipping** the network address (`.0`), the
+gateway (`.1`, which lives on the subnet bridge), and the broadcast address.
+Allocation is **lowest-free-first and deterministic**, so a restored allocator
+with the same reservations yields the same next address.
+
+| Method (on `NetworkController`) | Behavior |
+|---------------------------------|----------|
+| `allocate_address(subnet_id)` | Next free host (e.g. `10.0.1.2`); `Conflict` when exhausted |
+| `reserve_address(subnet_id, addr)` | Mark in use — used on restore to rebuild the pool |
+| `release_address(subnet_id, addr)` | Return to the pool (the gateway is never released) |
+
+The allocator is built automatically when a subnet is created (from its CIDR).
+It is std-only (IPv4 as `u32`, no IP-parsing crate); the pure helpers
+`parse_ipv4` / `format_ipv4` / `parse_cidr` are unit-tested, as are allocation,
+exhaustion (`/30`), and the no-usable-hosts case (`/31`).
+
+The [`ocf-api`](ocf-api.md) controller drives IPAM on **attachment**: when a
+workload attaches to a subnet (`POST /api/v1/workloads/:id/network`), it
+allocates an address, records the binding, and adds the address to the subnet's
+egress allow-list (if the workload opted in) — closing the loop so egress is
+gated on *real, assigned* addresses rather than caller-supplied ones.
+
+```mermaid
+sequenceDiagram
+    participant API as ocf-api controller
+    participant NC as NetworkController
+    participant IPAM as SubnetAllocator
+    API->>NC: attach_workload(wl, subnet, egress=true)
+    NC->>IPAM: allocate_address(subnet)
+    IPAM-->>NC: 10.0.1.2 (skips .0/.1)
+    NC->>NC: store attachment {subnet, egress, 10.0.1.2}
+    NC->>NC: refresh_subnet_egress(subnet, ["10.0.1.2"])
+    Note over NC: masquerade + forward-allow 10.0.1.2
+```
+
+## Cross-host VXLAN — stitching the overlay
+
+A VXLAN device created by `apply_vpc` has **no peers** until the remote VTEPs are
+programmed — encapsulated frames would otherwise go nowhere.
+`apply_vpc_peers(vpc, peer_vteps)` wires them, where `peer_vteps` are the
+**underlay addresses of the other fleet nodes**:
+
+| Backend | What it programs per peer |
+|---------|---------------------------|
+| `LinuxNetnsBackend` | `bridge fdb append 00:00:00:00:00:00 dev vxlan{vni} dst <peer>` — an all-zeros (BUM) flood entry per remote VTEP (head-end replication). Delete-then-append makes re-apply converge. |
+| `OvsBackend` | `ovs-vsctl --may-exist add-port ovs-{vni} vx{vni}-<peer> -- set interface … type=vxlan options:key={vni} options:remote_ip=<peer>` — one concrete-remote tunnel port per peer. |
+
+The [`ocf-api`](ocf-api.md) controller computes the peer set from the topology
+(`peer_vteps()` = every machine's `fabric_address` except this node's, matched by
+`config.node_id`) and calls `refresh_vpc_peers` for each VPC at boot
+(`program_vxlan_peers`). Fan-out is best-effort: a host that can't program FDB or
+OVS logs and is skipped.
+
+```mermaid
+flowchart LR
+    subgraph nodeA["Node A (VTEP 10.0.0.1)"]
+        vxA["vxlan1001<br/>fdb → 10.0.0.2, 10.0.0.3"]
+    end
+    subgraph nodeB["Node B (VTEP 10.0.0.2)"]
+        vxB["vxlan1001<br/>fdb → 10.0.0.1, 10.0.0.3"]
+    end
+    subgraph nodeC["Node C (VTEP 10.0.0.3)"]
+        vxC["vxlan1001<br/>fdb → 10.0.0.1, 10.0.0.2"]
+    end
+    vxA <-->|VXLAN/UDP 4789| vxB
+    vxA <-->|VXLAN/UDP 4789| vxC
+    vxB <-->|VXLAN/UDP 4789| vxC
+```
+
+> The chosen distributed-masquerade egress means a workload's egress source IP
+> follows the host it runs on (not stable across migration). A centralized
+> per-VPC NAT gateway — which would give a stable egress IP — remains the
+> alternative topology if that property is later required.
+
 ## Public API surface
 
 | Item | Kind | Notes |
 |------|------|-------|
 | `Vpc`, `Subnet`, `Route`, `AclRule`, `FirewallPolicy` | structs | re-exported from `model`; `Vpc`/`Subnet` impl `Resource` |
-| `AclAction`, `AclDirection`, `AclScope` | enums | serde `snake_case` |
-| `NetworkBackend` | trait | extends `Provider`; 4 `apply_*` methods |
+| `AclAction`, `AclDirection`, `AclScope`, `EgressMode` | enums | serde `snake_case`; `EgressMode` = `isolated`/`nat` |
+| `SubnetAllocator` | struct | per-subnet IPAM (`new`, `allocate`, `reserve`, `release`) |
+| `NetworkBackend` | trait | extends `Provider`; 4 `apply_*` + `apply_egress` + `apply_vpc_peers` |
 | `LinuxNetnsBackend` | struct | `name() == "linux-netns"`; `new`, `Default`, `Provider` |
 | `OvsBackend` | struct | `name() == "ovs"`; `new`, `Default`, `Provider` |
 | `register_builtins(&mut Registry<dyn NetworkBackend>)` | fn | registers `linux-netns` + `ovs` |

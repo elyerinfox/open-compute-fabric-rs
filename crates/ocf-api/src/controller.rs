@@ -22,6 +22,8 @@ use ocf_auth::{Authenticator, LinuxUserSync, LocalAuthenticator};
 use ocf_authz::{Group, RbacEngine, RoleBinding, Subject, User, ADMINISTRATOR_ROLE};
 use ocf_disk::{DiskHealth, DiskService, LedControl, PhysicalDisk, SysfsDiskManager};
 use ocf_fabric::{FabricMesh, FabricNode, FabricTransport, KeyPair, Membership, NodeId};
+use ocf_health::{HealthCheck, HealthService, PackageCheck};
+use ocf_platform::PlatformService;
 use ocf_inventory::InventoryService;
 use ocf_kernel::KernelManager;
 use ocf_loadbalancer::{
@@ -29,8 +31,8 @@ use ocf_loadbalancer::{
     RoutingPolicy,
 };
 use ocf_monitoring::MonitoringService;
-use ocf_network::{NetworkBackend, NetworkController, Subnet, Vpc};
-use ocf_runtime::{RuntimeProvider, Workload};
+use ocf_network::{EgressMode, NetworkBackend, NetworkController, Subnet, Vpc};
+use ocf_runtime::{NetworkAttachment, RuntimeProvider, Workload};
 use ocf_store::{MemoryStateStore, RedbStateStore, StateStore};
 use ocf_topology::{Datacenter, InMemoryTopology, Machine, Rack, Region, TopologyService, TopologyStore};
 
@@ -61,6 +63,14 @@ pub struct FabricController {
     pub loadbalancers: LoadBalancerController,
     pub cert_providers: Registry<dyn CertificateProvider>,
     pub dns_providers: Registry<dyn DnsProvider>,
+    /// Host OS detection + package managers (resolve/install missing tools).
+    pub platform: Arc<PlatformService>,
+    /// Modular fleet-health checks (kernel/runtime/network warnings + fixes).
+    pub health: HealthService,
+    /// Workload → subnet attachments. The runtime providers are stateless (they
+    /// query `docker`/`virsh` for live state), so the rich network binding lives
+    /// here, persisted, keyed by workload id.
+    pub(crate) attachments: parking_lot::RwLock<std::collections::HashMap<Id, NetworkAttachment>>,
 }
 
 impl FabricController {
@@ -122,6 +132,20 @@ impl FabricController {
         let mut cert_providers = Registry::<dyn CertificateProvider>::new();
         let mut dns_providers = Registry::<dyn DnsProvider>::new();
         ocf_loadbalancer::register_builtins(&mut cert_providers, &mut dns_providers)?;
+
+        // Platform: detect the host OS + register package managers, so health
+        // checks can offer OS-aware "install missing tool" fixes.
+        let platform = Arc::new(PlatformService::detect()?);
+        let mut health_reg = Registry::<dyn HealthCheck>::new();
+        ocf_health::register_builtins(&mut health_reg)?;
+        health_reg.register(
+            "packages",
+            Arc::new(PackageCheck::new(
+                platform.clone(),
+                ocf_platform::builtin_capabilities(),
+            )),
+        )?;
+        let health = HealthService::new(health_reg);
         let loadbalancers = LoadBalancerController::new();
 
         let membership = Arc::new(Membership::with_timeouts(
@@ -163,6 +187,9 @@ impl FabricController {
             loadbalancers,
             cert_providers,
             dns_providers,
+            platform,
+            health,
+            attachments: parking_lot::RwLock::new(std::collections::HashMap::new()),
         };
 
         // --- restore-or-seed ------------------------------------------------
@@ -179,15 +206,32 @@ impl FabricController {
         // --- membership / mesh ----------------------------------------------
         controller.init_membership().await?;
 
+        // --- stitch the overlay across hosts --------------------------------
+        controller.program_vxlan_peers().await;
+
         Ok(controller)
     }
 
-    /// Collect every workload across every registered runtime backend.
+    /// This node's id as a machine id, for tagging the health findings it
+    /// produces about its own host.
+    pub fn node_machine_id(&self) -> Id {
+        Id::from(self.node_id.clone())
+    }
+
+    /// Collect every workload across every registered runtime backend, overlaying
+    /// the stored network attachment (the providers are stateless and don't carry
+    /// it).
     pub async fn all_workloads(&self) -> Vec<Workload> {
         let mut out = Vec::new();
         for provider in self.runtimes.all() {
             if let Ok(mut wls) = provider.list().await {
                 out.append(&mut wls);
+            }
+        }
+        let attachments = self.attachments.read();
+        for w in &mut out {
+            if let Some(att) = attachments.get(&w.metadata.id) {
+                w.network = Some(att.clone());
             }
         }
         out
@@ -206,6 +250,115 @@ impl FabricController {
             }
         }
         Ok(out)
+    }
+
+    /// The subnet addresses of workloads that have opted in to egress on
+    /// `subnet_id` — the allow-list the egress data path is programmed with.
+    /// Read from the persisted attachment store (the runtime providers are
+    /// stateless and don't carry the binding).
+    pub fn subnet_egress_allowed(&self, subnet_id: &Id) -> Vec<String> {
+        self.attachments
+            .read()
+            .values()
+            .filter(|a| &a.subnet_id == subnet_id && a.egress)
+            .filter_map(|a| a.address.clone())
+            .collect()
+    }
+
+    /// Attach a workload to a subnet: allocate it an address (IPAM), record the
+    /// binding with its egress opt-in, re-program the subnet's egress allow-list,
+    /// and persist. Returns the resulting attachment.
+    pub async fn attach_workload(
+        &self,
+        workload_id: &Id,
+        subnet_id: &Id,
+        egress: bool,
+    ) -> Result<NetworkAttachment> {
+        // Validate the subnet exists.
+        let _ = self.network.get_subnet(subnet_id).await?;
+
+        // Release any prior address for this workload before re-allocating.
+        if let Some(prev) = self.attachments.read().get(workload_id).cloned() {
+            self.network.release_address(&prev.subnet_id, prev.address.as_deref().unwrap_or(""));
+        }
+
+        // Allocate a fresh address from the subnet's pool.
+        let address = self.network.allocate_address(subnet_id)?;
+        let attachment = NetworkAttachment::new(subnet_id.clone())
+            .with_egress(egress)
+            .with_address(address);
+        self.attachments
+            .write()
+            .insert(workload_id.clone(), attachment.clone());
+
+        // Re-program egress for the subnet with the new allow-list.
+        let allowed = self.subnet_egress_allowed(subnet_id);
+        if let Err(e) = self.network.refresh_subnet_egress(subnet_id, &allowed).await {
+            tracing::warn!(error = %e, "egress refresh after attach failed (binding recorded)");
+        }
+
+        let _ = self.persist().await;
+        Ok(attachment)
+    }
+
+    /// Detach a workload from its subnet: release its address and re-program the
+    /// subnet's egress allow-list. No-op if the workload has no attachment.
+    pub async fn detach_workload(&self, workload_id: &Id) -> Result<()> {
+        let removed = self.attachments.write().remove(workload_id);
+        if let Some(att) = removed {
+            self.network
+                .release_address(&att.subnet_id, att.address.as_deref().unwrap_or(""));
+            let allowed = self.subnet_egress_allowed(&att.subnet_id);
+            if let Err(e) = self.network.refresh_subnet_egress(&att.subnet_id, &allowed).await {
+                tracing::warn!(error = %e, "egress refresh after detach failed");
+            }
+            let _ = self.persist().await;
+        }
+        Ok(())
+    }
+
+    /// The underlay VTEP addresses of the *other* nodes in the fleet — the peers
+    /// a VXLAN overlay must be stitched to. Derived from each machine's
+    /// `fabric_address`, excluding the machine that is this node (matched by name
+    /// to `config.node_id`, best-effort).
+    pub async fn peer_vteps(&self) -> Vec<String> {
+        let machines = match self.topology.store().all_machines().await {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        machines
+            .into_iter()
+            .filter(|m| m.metadata.name != self.node_id)
+            .filter_map(|m| m.fabric_address)
+            .collect()
+    }
+
+    /// Program every VPC's VXLAN overlay with the current peer VTEP set, so the
+    /// overlay is stitched across hosts. Best-effort.
+    pub async fn program_vxlan_peers(&self) {
+        let peers = self.peer_vteps().await;
+        if peers.is_empty() {
+            return;
+        }
+        let vpcs = match self.network.list_vpcs().await {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        for vpc in vpcs {
+            let _ = self.network.refresh_vpc_peers(&vpc.metadata.id, &peers).await;
+        }
+    }
+
+    /// Set a subnet's egress capability (`Nat` or `Isolated`), re-program the
+    /// dataplane with the current opted-in workload addresses, and persist.
+    pub async fn set_subnet_egress(&self, subnet_id: &Id, mode: EgressMode) -> Result<Subnet> {
+        let allowed = self.subnet_egress_allowed(subnet_id);
+        let subnet = self
+            .network
+            .set_subnet_egress(subnet_id, mode, &allowed)
+            .await?;
+        let _ = self.persist().await;
+        Ok(subnet)
     }
 
     /// Seed a small, illustrative fleet (used on first boot only).
@@ -339,8 +492,12 @@ async fn seed_network(network: &NetworkController) -> Result<()> {
         .create_vpc(Vpc::new("tenant-a", "10.0.0.0/16", 1001))
         .await?;
     let vpc_id = vpc.metadata.id.clone();
+    // The "web" subnet is public (NAT egress); "db" stays internal-only.
     network
-        .create_subnet(Subnet::new(vpc_id.clone(), "web", "10.0.1.0/24", "ns-web"))
+        .create_subnet(
+            Subnet::new(vpc_id.clone(), "web", "10.0.1.0/24", "ns-web")
+                .with_egress(EgressMode::Nat),
+        )
         .await?;
     network
         .create_subnet(Subnet::new(vpc_id, "db", "10.0.2.0/24", "ns-db"))

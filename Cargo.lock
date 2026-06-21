@@ -1006,14 +1006,17 @@ dependencies = [
  "ocf-core",
  "ocf-disk",
  "ocf-fabric",
+ "ocf-health",
  "ocf-inventory",
  "ocf-kernel",
  "ocf-loadbalancer",
  "ocf-monitoring",
  "ocf-network",
+ "ocf-platform",
  "ocf-runtime",
  "ocf-store",
  "ocf-topology",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",
@@ -1106,6 +1109,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocf-health"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ocf-core",
+ "ocf-platform",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ocf-inventory"
 version = "0.1.0"
 dependencies = [
@@ -1165,6 +1182,17 @@ dependencies = [
  "chrono",
  "ocf-core",
  "parking_lot",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ocf-platform"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ocf-core",
  "serde",
  "tokio",
  "tracing",

@@ -99,4 +99,6 @@ fn print_providers(c: &FabricController) {
     show("IpmiController", c.inventory_controllers.ipmi.all());
     show("CertificateProvider", c.cert_providers.all());
     show("DnsProvider", c.dns_providers.all());
+    show("HealthCheck", c.health.checks().all());
+    show("PackageManager", c.platform.managers().all());
 }

@@ -1,0 +1,14 @@
+[package]
+name = "ocf-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Host OS detection and pluggable package managers — resolve and install missing capabilities across operating systems."
+
+[dependencies]
+ocf-core.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tokio.workspace = true

@@ -33,7 +33,7 @@ pub use autoscaler::{evaluate, AutoscaleDecision, Autoscaler, Comparison, Scalin
 pub use migration::{MigrationReport, Migrator};
 pub use provider::RuntimeProvider;
 pub use providers::{DockerRuntime, LxcRuntime, PodmanRuntime, QemuRuntime};
-pub use workload::{MemorySnapshot, RuntimeKind, Workload};
+pub use workload::{MemorySnapshot, NetworkAttachment, RuntimeKind, Workload};
 
 use ocf_core::prelude::*;
 use std::sync::Arc;

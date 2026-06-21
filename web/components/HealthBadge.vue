@@ -25,6 +25,9 @@ const STYLES: Record<string, string> = {
   failing: 'bg-rose-500/15 text-rose-400 ring-rose-500/30',
   // status endpoint
   down: 'bg-rose-500/15 text-rose-400 ring-rose-500/30',
+  // Health-finding Severity
+  info: 'bg-sky-500/15 text-sky-400 ring-sky-500/30',
+  critical: 'bg-rose-500/15 text-rose-400 ring-rose-500/30',
 }
 
 const DOT: Record<string, string> = {
@@ -41,6 +44,8 @@ const DOT: Record<string, string> = {
   pending: 'bg-sky-400',
   creating: 'bg-sky-400',
   stopped: 'bg-slate-400',
+  info: 'bg-sky-400',
+  critical: 'bg-rose-400',
 }
 
 const key = computed(() => props.status?.toLowerCase?.() ?? '')

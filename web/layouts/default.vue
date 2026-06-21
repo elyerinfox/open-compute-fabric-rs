@@ -13,6 +13,7 @@ interface NavItem {
 
 const nav: NavItem[] = [
   { to: '/', label: 'Dashboard', icon: 'M3 12l9-9 9 9M5 10v10a1 1 0 001 1h4v-6h4v6h4a1 1 0 001-1V10' },
+  { to: '/health', label: 'Health', icon: 'M3 12h4l2 5 4-12 2 7h6' },
   { to: '/topology', label: 'Topology', icon: 'M4 5h6v6H4V5zm10 8h6v6h-6v-6zM7 11v4a2 2 0 002 2h4' },
   { to: '/workloads', label: 'Workloads', icon: 'M4 6h16M4 12h16M4 18h16' },
   { to: '/networking', label: 'Networking', icon: 'M12 3v18m0-18a4 4 0 014 4c0 2-2 3-4 3s-4-1-4-3a4 4 0 014-4zm-8 9h16' },

@@ -22,12 +22,14 @@
 
 pub mod backend;
 pub mod controller;
+pub mod ipam;
 pub mod model;
 
 pub use backend::{register_builtins, LinuxNetnsBackend, NetworkBackend, OvsBackend};
 pub use controller::NetworkController;
+pub use ipam::SubnetAllocator;
 pub use model::{
-    AclAction, AclDirection, AclRule, AclScope, FirewallPolicy, Route, Subnet, Vpc,
+    AclAction, AclDirection, AclRule, AclScope, EgressMode, FirewallPolicy, Route, Subnet, Vpc,
 };
 
 #[cfg(test)]
@@ -95,6 +97,46 @@ mod tests {
 
         // VPC cannot be deleted while a subnet references it.
         assert!(ctl.delete_vpc(&vpc.metadata.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn subnet_egress_capability_and_refresh() {
+        let ctl = controller();
+        let vpc = ctl
+            .create_vpc(Vpc::new("tenant-egr", "10.2.0.0/16", 102))
+            .await
+            .expect("create vpc");
+
+        // A Nat-capable subnet is created with egress programmed (NullBackend
+        // no-ops, so creation succeeds and records the capability).
+        let subnet = ctl
+            .create_subnet(
+                Subnet::new(vpc.metadata.id.clone(), "public", "10.2.1.0/24", "ns-pub")
+                    .with_egress(EgressMode::Nat),
+            )
+            .await
+            .expect("create nat subnet");
+        assert_eq!(subnet.egress, EgressMode::Nat);
+
+        // Re-programming with an opted-in workload address fans out cleanly.
+        ctl.refresh_subnet_egress(&subnet.metadata.id, &["10.2.1.5".to_string()])
+            .await
+            .expect("refresh egress");
+
+        // Toggling the capability updates the stored subnet.
+        let updated = ctl
+            .set_subnet_egress(&subnet.metadata.id, EgressMode::Isolated, &[])
+            .await
+            .expect("disable egress");
+        assert_eq!(updated.egress, EgressMode::Isolated);
+        let reread = ctl.get_subnet(&subnet.metadata.id).await.unwrap();
+        assert_eq!(reread.egress, EgressMode::Isolated);
+
+        // Refreshing egress for an unknown subnet errors.
+        assert!(ctl
+            .refresh_subnet_egress(&Id::new(), &[])
+            .await
+            .is_err());
     }
 
     #[tokio::test]

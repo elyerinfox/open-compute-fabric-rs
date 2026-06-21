@@ -110,8 +110,25 @@ pub enum RuntimeKind { Container, VirtualMachine }
 | `highly_available` | `bool` | Keep running across node loss (migration-eligible within `placement`) |
 | `placement` | `Option<Scope>` | Placement restriction; `None` = whole fleet is fair game |
 | `env` | `BTreeMap<String, String>` | Environment variables injected into the workload (sorted, deterministic) |
+| `network` | `Option<NetworkAttachment>` | SDN subnet attachment + outbound-internet opt-in; `None` = backend default networking |
 
-**Constructors & builders:** `Workload::container(name, image)` and `Workload::virtual_machine(name, image)` create `Pending`, unscoped, non-HA workloads with default resources and empty env. Chainable builders: `.with_resources(spec)`, `.on_node(id)`, `.within(scope)`, `.highly_available(bool)`.
+**`NetworkAttachment`** binds a workload to an `ocf-network` subnet (the `subnet_id` is a bare [`Id`] so this crate stays decoupled from `ocf-network`):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `subnet_id` | `Id` | The subnet the workload is placed in |
+| `egress` | `bool` | **Opt-in** for outbound internet; default `false`. Effective only when the subnet's capability is `Nat` (see [ocf-network → Egress](ocf-network.md#egress-outbound-internet--nat)) |
+| `address` | `Option<String>` | The workload's subnet address — **auto-assigned by [IPAM](ocf-network.md#ipam--per-subnet-address-allocation)** on attach; egress gating is keyed on it |
+
+In practice the binding is created via `POST /api/v1/workloads/:id/network` (see
+[REST API](../reference/rest-api.md#post-apiv1workloadsidnetwork)), which the
+[`ocf-api`](ocf-api.md) controller persists (the runtime providers are stateless,
+so the attachment lives in the controller's store, overlaid onto listed
+workloads).
+
+Constructor `NetworkAttachment::new(subnet_id)` (egress off); builders `.with_egress(bool)`, `.with_address(addr)`. `Workload::wants_egress()` reports the opt-in.
+
+**Constructors & builders:** `Workload::container(name, image)` and `Workload::virtual_machine(name, image)` create `Pending`, unscoped, non-HA workloads with default resources and empty env. Chainable builders: `.with_resources(spec)`, `.on_node(id)`, `.within(scope)`, `.highly_available(bool)`, `.with_network(attachment)`.
 
 **Placement scope.** `permits_placement(target: &Scope) -> bool` is the gate that both initial placement and migration consult:
 

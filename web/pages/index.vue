@@ -7,23 +7,30 @@ const { bytes, number, bitsPerSec } = useFormat()
 // Pull the data the dashboard summarizes. useAsyncData caches per-key and runs
 // on the server for the first paint.
 const { data } = await useAsyncData('dashboard', async () => {
-  const [topology, workloads, disks, host, lbs] = await Promise.all([
+  const [topology, workloads, disks, host, lbs, health] = await Promise.all([
     api.getTopologyTree(),
     api.listWorkloads(),
     api.listDisks(),
     api.getHostMetrics(),
     api.listLoadBalancers(),
+    api.getHealthFindings(),
   ])
-  return { topology, workloads, disks, host, lbs }
+  return { topology, workloads, disks, host, lbs, health }
 })
 
-// All five calls share the same source; if any fell back, surface "mock".
+// All calls share the same source; if any fell back, surface "mock".
 const source = computed<'live' | 'mock'>(() => {
   const d = data.value
   if (!d) return 'mock'
-  const all = [d.topology, d.workloads, d.disks, d.host, d.lbs]
+  const all = [d.topology, d.workloads, d.disks, d.host, d.lbs, d.health]
   return all.every((r) => r.source === 'live') ? 'live' : 'mock'
 })
+
+// Fleet-health findings needing attention (warnings + criticals).
+const healthFindings = computed(() => data.value?.health.data ?? [])
+const healthAttention = computed(
+  () => healthFindings.value.filter((f) => f.severity === 'warning' || f.severity === 'critical').length,
+)
 
 // Flatten the topology tree to count machines and their health.
 function flattenMachines(node: TopologyNode | undefined, acc: TopologyNode[] = []): TopologyNode[] {
@@ -79,6 +86,21 @@ const diskPct = computed(() => {
 
     <!-- Summary cards -->
     <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <NuxtLink to="/health" class="block transition-transform hover:-translate-y-0.5">
+        <StatCard
+          label="Health"
+          :value="healthAttention"
+          :hint="healthAttention > 0 ? 'warnings need attention' : 'all checks passing'"
+          :accent="healthAttention > 0 ? 'amber' : 'emerald'"
+        >
+          <template #icon>
+            <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M3 12h4l2 5 4-12 2 7h6" />
+            </svg>
+          </template>
+        </StatCard>
+      </NuxtLink>
+
       <StatCard
         label="Machines"
         :value="machineCount"

@@ -57,6 +57,54 @@ pub struct Workload {
     /// Environment variables injected into the workload.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Optional attachment to an SDN subnet. `None` means the workload uses the
+    /// backend's default networking; `Some` places it in a subnet and declares
+    /// whether it gets outbound internet access.
+    #[serde(default)]
+    pub network: Option<NetworkAttachment>,
+}
+
+/// A workload's attachment to an SDN subnet.
+///
+/// `subnet_id` references an `ocf-network` `Subnet` (kept as a bare [`Id`] so the
+/// runtime crate does not depend on `ocf-network`). `egress` is the workload's
+/// **opt-in** for outbound internet: the workload only reaches the internet when
+/// its subnet's capability is `Nat` *and* this flag is `true`. Inbound traffic is
+/// the load balancer's concern, never expressed here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkAttachment {
+    /// The subnet this workload is placed in.
+    pub subnet_id: Id,
+    /// Opt-in for outbound (egress) internet access. Default `false`.
+    #[serde(default)]
+    pub egress: bool,
+    /// The workload's assigned address within the subnet, when known. Egress
+    /// gating is keyed on this address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+impl NetworkAttachment {
+    /// Attach to `subnet_id` with egress disabled (the default, internal-only).
+    pub fn new(subnet_id: impl Into<Id>) -> Self {
+        NetworkAttachment {
+            subnet_id: subnet_id.into(),
+            egress: false,
+            address: None,
+        }
+    }
+
+    /// Builder: opt the workload in to (or out of) outbound internet access.
+    pub fn with_egress(mut self, egress: bool) -> Self {
+        self.egress = egress;
+        self
+    }
+
+    /// Builder: record the workload's assigned subnet address.
+    pub fn with_address(mut self, address: impl Into<String>) -> Self {
+        self.address = Some(address.into());
+        self
+    }
 }
 
 impl Workload {
@@ -72,6 +120,7 @@ impl Workload {
             highly_available: false,
             placement: None,
             env: BTreeMap::new(),
+            network: None,
         }
     }
 
@@ -87,6 +136,7 @@ impl Workload {
             highly_available: false,
             placement: None,
             env: BTreeMap::new(),
+            network: None,
         }
     }
 
@@ -112,6 +162,19 @@ impl Workload {
     pub fn highly_available(mut self, ha: bool) -> Self {
         self.highly_available = ha;
         self
+    }
+
+    /// Builder: attach the workload to an SDN subnet.
+    pub fn with_network(mut self, attachment: NetworkAttachment) -> Self {
+        self.network = Some(attachment);
+        self
+    }
+
+    /// Whether this workload has opted in to outbound internet access. Only
+    /// meaningful when attached to a subnet whose capability is `Nat`; the subnet
+    /// check is enforced by the network controller.
+    pub fn wants_egress(&self) -> bool {
+        self.network.as_ref().map(|n| n.egress).unwrap_or(false)
     }
 
     /// Whether the workload's `placement` scope permits running at `target`.

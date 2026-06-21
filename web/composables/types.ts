@@ -189,3 +189,32 @@ export interface HealthReport {
   status: 'ok' | 'degraded' | 'down'
   version?: string
 }
+
+// ── Fleet health (ocf-health) ───────────────────────────────────────────────
+
+/** ocf-health::Severity (serde lowercase). */
+export type Severity = 'info' | 'warning' | 'critical'
+
+/** ocf-health::Category (serde lowercase). */
+export type HealthCategory = 'kernel' | 'network' | 'runtime' | 'storage' | 'other'
+
+/** A single remediation a finding offers — the body posted to /health/fix. */
+export interface FixAction {
+  id: string
+  label: string
+  description: string
+  requires_root: boolean
+}
+
+/** ocf-health::HealthFinding — one detected problem on a node, with fixes. */
+export interface HealthFinding {
+  id: string
+  check: string
+  category: HealthCategory
+  machine_id: Id
+  severity: Severity
+  title: string
+  detail: string
+  fixes: FixAction[]
+  detected_at: string
+}

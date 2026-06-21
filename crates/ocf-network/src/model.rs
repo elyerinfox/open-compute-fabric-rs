@@ -41,6 +41,31 @@ impl Resource for Vpc {
     }
 }
 
+/// Whether a subnet provides outbound (egress) internet access.
+///
+/// This is the subnet-level *capability* — the "public vs private subnet"
+/// distinction. A workload only actually reaches the internet when its subnet is
+/// [`EgressMode::Nat`] **and** the workload itself opts in
+/// (`NetworkAttachment::egress`); see [`crate::controller`] and the workload
+/// model in `ocf-runtime`. Inbound connections are not handled here at all —
+/// those are the load balancer's responsibility (`ocf-loadbalancer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressMode {
+    /// No outbound internet routing; the subnet is internal-only (default).
+    #[default]
+    Isolated,
+    /// Outbound internet via source NAT (masquerade) out the host's uplink.
+    Nat,
+}
+
+impl EgressMode {
+    /// Whether this mode provides outbound internet routing.
+    pub fn provides_egress(&self) -> bool {
+        matches!(self, EgressMode::Nat)
+    }
+}
+
 /// A subnet carved out of a [`Vpc`], realized on a host inside a netns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subnet {
@@ -51,6 +76,10 @@ pub struct Subnet {
     pub cidr: String,
     /// Name of the Linux network namespace that hosts this subnet's dataplane.
     pub netns: String,
+    /// Outbound internet capability for this subnet. Defaults to
+    /// [`EgressMode::Isolated`] so existing/persisted subnets stay internal-only.
+    #[serde(default)]
+    pub egress: EgressMode,
 }
 
 impl Subnet {
@@ -65,7 +94,14 @@ impl Subnet {
             vpc_id,
             cidr: cidr.into(),
             netns: netns.into(),
+            egress: EgressMode::Isolated,
         }
+    }
+
+    /// Builder: set the subnet's egress capability.
+    pub fn with_egress(mut self, egress: EgressMode) -> Self {
+        self.egress = egress;
+        self
     }
 }
 

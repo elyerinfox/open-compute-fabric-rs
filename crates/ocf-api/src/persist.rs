@@ -15,7 +15,7 @@ use ocf_authz::{Group, Role, RoleBinding, User};
 use ocf_disk::PhysicalDisk;
 use ocf_loadbalancer::LoadBalancer;
 use ocf_network::{Subnet, Vpc};
-use ocf_runtime::{RuntimeKind, Workload};
+use ocf_runtime::{NetworkAttachment, RuntimeKind, Workload};
 use ocf_topology::{Datacenter, Machine, Rack, Region};
 
 impl FabricController {
@@ -79,6 +79,13 @@ impl FabricController {
 
         for d in self.all_disks().await? {
             self.persist_put("disks", &d.serial, &d).await?;
+        }
+
+        // Workload → subnet attachments (the IP/egress binding lives here, not in
+        // the stateless runtime providers).
+        let attachments = self.attachments.read().clone();
+        for (wid, att) in &attachments {
+            self.persist_put("workload_networks", wid.as_str(), att).await?;
         }
 
         tracing::info!("fabric state committed through raft and persisted");
@@ -147,6 +154,21 @@ impl FabricController {
 
         for d in store.list_json::<PhysicalDisk>("disks")? {
             self.disk_mgr.seed(d);
+        }
+
+        // Workload → subnet attachments. The store keys by workload id; reserve
+        // each restored address in IPAM so the pool reflects what's already
+        // assigned (subnets/allocators were restored just above).
+        for (wid, bytes) in store.list("workload_networks")? {
+            match serde_json::from_slice::<NetworkAttachment>(&bytes) {
+                Ok(att) => {
+                    if let Some(addr) = &att.address {
+                        let _ = self.network.reserve_address(&att.subnet_id, addr);
+                    }
+                    self.attachments.write().insert(Id::from(wid), att);
+                }
+                Err(e) => tracing::warn!(workload = %wid, error = %e, "skipping undecodable attachment"),
+            }
         }
 
         tracing::info!("fabric state restored from durable store");

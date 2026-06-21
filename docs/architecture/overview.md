@@ -114,6 +114,8 @@ flowchart TB
 | Foundation | `ocf-store` | Durable, namespaced key/value store (redb) | [→](../subsystems/ocf-store.md) |
 | Foundation | `ocf-fabric` | Encrypted host-to-host mesh + SWIM membership | [→](../subsystems/ocf-fabric.md) |
 | Foundation | `ocf-consensus` | Raft-replicated control-plane store (openraft) | [→](../subsystems/ocf-consensus.md) |
+| Foundation | `ocf-health` | Modular fleet-health checks + user-pressable fixes | [→](../subsystems/ocf-health.md) |
+| Foundation | `ocf-platform` | OS detection + cross-OS package managers | [→](../subsystems/ocf-platform.md) |
 | Subsystem | `ocf-topology` | `region → datacenter → rack → machine` model | [→](../subsystems/ocf-topology.md) |
 | Subsystem | `ocf-runtime` | Containers & VMs, live migration, autoscaling | [→](../subsystems/ocf-runtime.md) |
 | Subsystem | `ocf-auth` | Authentication (PAM/AD/local) + host user sync | [→](../subsystems/ocf-auth.md) |

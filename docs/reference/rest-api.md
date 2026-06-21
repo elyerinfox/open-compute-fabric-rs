@@ -31,8 +31,11 @@ handler is a thin adapter that borrows one subsystem off the
 | `GET` | `/api/v1/machines` | Topology | Every machine across the fleet |
 | `GET` | `/api/v1/workloads` | Runtime | Every workload across every runtime backend |
 | `POST` | `/api/v1/workloads/:id/migrate` | Runtime | Request live migration of a workload |
+| `POST` | `/api/v1/workloads/:id/network` | Runtime | Attach a workload to a subnet (allocates an IP via IPAM) |
+| `DELETE` | `/api/v1/workloads/:id/network` | Runtime | Detach a workload from its subnet (releases its IP) |
 | `GET` | `/api/v1/networks/vpcs` | Network | Every VPC |
 | `GET` | `/api/v1/networks/subnets` | Network | Every subnet across every VPC |
+| `POST` | `/api/v1/networks/subnets/:id/egress` | Network | Set a subnet's outbound-internet (NAT) capability |
 | `GET` | `/api/v1/loadbalancers` | LoadBalancer | Every load balancer |
 | `GET` | `/api/v1/disks` | Storage | Every physical disk across the fleet |
 | `GET` | `/api/v1/metrics/host` | Monitoring | Aggregate host resource usage |
@@ -44,6 +47,9 @@ handler is a thin adapter that borrows one subsystem off the
 | `GET` | `/api/v1/access/roles` | Access/RBAC | Every RBAC role |
 | `GET` | `/api/v1/access/groups` | Access/RBAC | Every RBAC group |
 | `POST` | `/api/v1/admin/persist` | Admin | Snapshot current state to the durable store |
+| `GET` | `/api/v1/health/findings` | Health | Fleet-health findings for this node (problems + fixes) |
+| `POST` | `/api/v1/health/fix` | Health | Apply a finding's fix action |
+| `GET` | `/api/v1/platform` | Health | Host OS, package manager, and per-capability readiness |
 
 ## Endpoints by subsystem
 
@@ -460,6 +466,39 @@ workload.
 }
 ```
 
+### `POST /api/v1/workloads/:id/network`
+
+Attach a workload to an SDN subnet. The controller **allocates an address from
+the subnet via IPAM** (skipping `.0`/`.1`/broadcast), records the binding, and —
+if `egress` is `true` and the subnet is `Nat` — adds the address to the subnet's
+egress allow-list. The binding is persisted (the runtime providers are
+stateless). See [ocf-network → IPAM](../subsystems/ocf-network.md#ipam--per-subnet-address-allocation).
+
+**Request body**
+
+```json
+{ "subnet_id": "web", "egress": true }
+```
+
+`egress` defaults to `false` (internal-only). An unknown `subnet_id` → `404`.
+
+**Response** — the resulting [`NetworkAttachment`](../subsystems/ocf-runtime.md):
+
+```json
+{ "subnet_id": "web", "egress": true, "address": "10.0.1.2" }
+```
+
+### `DELETE /api/v1/workloads/:id/network`
+
+Detach a workload: release its allocated address back to the subnet pool and
+re-program the egress allow-list. Idempotent (no-op if not attached).
+
+**Response**
+
+```json
+{ "detached": true }
+```
+
 ---
 
 ## Network
@@ -511,7 +550,8 @@ hosting the subnet's dataplane.
     },
     "vpc_id": "tenant-a",
     "cidr": "10.0.1.0/24",
-    "netns": "ns-web"
+    "netns": "ns-web",
+    "egress": "nat"
   },
   {
     "metadata": {
@@ -524,9 +564,43 @@ hosting the subnet's dataplane.
     },
     "vpc_id": "tenant-a",
     "cidr": "10.0.2.0/24",
-    "netns": "ns-db"
+    "netns": "ns-db",
+    "egress": "isolated"
   }
 ]
+```
+
+`egress` is the subnet's outbound-internet capability: `"isolated"` (internal
+only, the default) or `"nat"` (public — source-NAT to the internet). See
+[ocf-network → Egress](../subsystems/ocf-network.md#egress-outbound-internet--nat).
+
+### `POST /api/v1/networks/subnets/:id/egress`
+
+Set a subnet's outbound-internet capability. When set to `nat` the host dataplane
+is (re)programmed with IP forwarding + a masquerade of the subnet CIDR out the
+default uplink, gated to the workloads that opted in; `isolated` tears it down.
+The capability is recorded even if a host can't program its dataplane right now.
+Inbound connections are unaffected — those are the load balancer's job.
+
+**Request body**
+
+```json
+{ "mode": "nat" }
+```
+
+`mode` is `"nat"` or `"isolated"` (case-insensitive). Any other value → `400`.
+
+**Response** — the updated [`Subnet`](../subsystems/ocf-network.md):
+
+```json
+{
+  "metadata": { "id": "web", "name": "web", "labels": {}, "annotations": {},
+    "created_at": "2026-06-20T12:00:00Z", "updated_at": "2026-06-21T09:30:00Z" },
+  "vpc_id": "tenant-a",
+  "cidr": "10.0.1.0/24",
+  "netns": "ns-web",
+  "egress": "nat"
+}
 ```
 
 ---
@@ -865,6 +939,91 @@ a no-op write-through to the in-memory store otherwise).
 ```json
 { "persisted": true }
 ```
+
+---
+
+## Health (fleet checks)
+
+The modular fleet-health system. See [`ocf-health`](../subsystems/ocf-health.md).
+**Distinct from `GET /api/v1/health`** (the liveness probe under Health/Discovery).
+
+### `GET /api/v1/health/findings`
+
+Run every registered [health check](../subsystems/ocf-health.md#built-in-checks)
+against this node and return the findings (problems), worst severity first. Each
+finding carries the [`FixAction`](../subsystems/ocf-health.md#fixaction)s the user
+can press. An empty array means all checks pass (or can't be assessed on this
+host). `category` is `kernel`/`network`/`runtime`/`storage`/`other`; `severity`
+is `info`/`warning`/`critical`.
+
+**Response**
+
+```json
+[
+  {
+    "id": "ip-forwarding:node-local:disabled",
+    "check": "ip-forwarding",
+    "category": "kernel",
+    "machine_id": "node-local",
+    "severity": "warning",
+    "title": "IP forwarding not enabled on kernel",
+    "detail": "net.ipv4.ip_forward is 0. The node cannot route between subnets …",
+    "fixes": [
+      {
+        "id": "enable-ipv4-forwarding",
+        "label": "Enable IP forwarding",
+        "description": "Writes 1 to /proc/sys/net/ipv4/ip_forward on this node.",
+        "requires_root": true
+      }
+    ],
+    "detected_at": "2026-06-21T18:45:28Z"
+  }
+]
+```
+
+### `POST /api/v1/health/fix`
+
+Apply a finding's fix. The fix is routed to the check that advertised it and run
+on this node.
+
+**Request body**
+
+```json
+{ "check": "ip-forwarding", "fix": "enable-ipv4-forwarding" }
+```
+
+**Response**
+
+```json
+{ "applied": true, "outcome": "IPv4 forwarding enabled (net.ipv4.ip_forward = 1)." }
+```
+
+An unknown `check` or `fix` → `404`; a fix command that fails (no root, tool
+absent, not Linux) → `500` with the real error message.
+
+### `GET /api/v1/platform`
+
+The detected host OS, the package manager selected for it, and per-capability
+readiness (which required tools are present, and the package that would install
+each missing one). See [`ocf-platform`](../subsystems/ocf-platform.md).
+
+**Response** (a Linux host with apt)
+
+```json
+{
+  "os": { "os": "linux", "distro": "ubuntu", "id_like": ["debian"], "pretty": "Ubuntu 24.04 LTS" },
+  "active_manager": "apt",
+  "capabilities": [
+    { "name": "nftables", "binary": "nft", "present": true, "package": "nftables" },
+    { "name": "iproute2", "binary": "ip", "present": true, "package": "iproute2" },
+    { "name": "openvswitch", "binary": "ovs-vsctl", "present": false, "package": "openvswitch-switch" }
+  ]
+}
+```
+
+On a host with no supported package manager (e.g. Windows), `active_manager` is
+omitted and each capability's `package` is omitted; missing tools are reported
+but not offered as installable.
 
 ---
 
