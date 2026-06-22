@@ -366,6 +366,20 @@ impl FabricController {
             tracing::info!("joining a cluster; skipping seed (state replicates from the leader)");
         }
 
+        // --- this node's reachable address ----------------------------------
+        // Resolve the address peers dial this node at: an explicit override, else
+        // the auto-detected primary LAN/route address (the router-assigned address
+        // on a host behind NAT). Applied to this node's own machine so the mesh,
+        // WireGuard, and Raft advertise the real address rather than a seeded one.
+        let resolved_addr = controller
+            .config
+            .fabric_address
+            .clone()
+            .or_else(ocf_fabric::detect_local_address);
+        if let Some(addr) = &resolved_addr {
+            controller.set_self_fabric_address(addr).await;
+        }
+
         // --- membership / mesh ----------------------------------------------
         controller.init_membership().await?;
 
@@ -546,6 +560,42 @@ impl FabricController {
             .enumerate()
             .map(|(i, m)| (m.metadata.id.clone(), m.metadata.name, i, m.fabric_address))
             .collect()
+    }
+
+    /// Set this node's own machine `fabric_address` to `addr` (its detected or
+    /// configured reachable address). No-op if this process has no matching machine
+    /// in topology (e.g. the default single-process demo, where `node_id` is not a
+    /// seeded machine name).
+    async fn set_self_fabric_address(&self, addr: &str) {
+        let machines = self
+            .topology
+            .store()
+            .all_machines()
+            .await
+            .unwrap_or_default();
+        match machines.into_iter().find(|m| m.metadata.name == self.node_id) {
+            Some(mut machine) => {
+                if machine.fabric_address.as_deref() == Some(addr) {
+                    return;
+                }
+                let source = if self.config.fabric_address.is_some() {
+                    "configured"
+                } else {
+                    "auto-detected"
+                };
+                machine.fabric_address = Some(addr.to_string());
+                if self.topology.store().put_machine(machine).await.is_ok() {
+                    let _ = self.persist().await;
+                    tracing::info!(node = %self.node_id, %addr, source, "set this node's fabric address");
+                }
+            }
+            None => {
+                tracing::info!(
+                    node = %self.node_id, %addr,
+                    "resolved fabric address (no matching machine to apply it to)"
+                );
+            }
+        }
     }
 
     /// This node's index in the plan (for address assignment), if present.

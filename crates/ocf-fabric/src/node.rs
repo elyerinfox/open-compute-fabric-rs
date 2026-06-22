@@ -98,6 +98,34 @@ impl FabricNode {
     }
 }
 
+/// Best-effort detection of this host's primary reachable IPv4 — the source
+/// address the kernel would use toward the default route. This is the
+/// **router-assigned LAN address** on a host behind a home/office router
+/// (`192.168.x.x`, `10.x.x.x`, …), and the right interface even with several NICs.
+///
+/// It opens a connected UDP socket toward a routable target and reads back the
+/// chosen local address; **no packets are sent** (UDP `connect` only selects a
+/// route). Returns `None` when there's no usable route (offline, or no default
+/// gateway) — the operator then sets the address explicitly.
+pub fn detect_local_address() -> Option<String> {
+    use std::net::UdpSocket;
+    // Any routable destination works; we never transmit to it.
+    for target in ["8.8.8.8:80", "1.1.1.1:80"] {
+        let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
+            continue;
+        };
+        if sock.connect(target).is_ok() {
+            if let Ok(local) = sock.local_addr() {
+                let ip = local.ip();
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +136,15 @@ mod tests {
         let node = FabricNode::from_keypair(&kp, vec!["10.0.0.1:7777".into()]);
         assert_eq!(node.node_id, kp.node_id());
         assert_eq!(node.primary_endpoint(), Some("10.0.0.1:7777"));
+    }
+
+    #[test]
+    fn detect_local_address_is_sane_or_none() {
+        // Never panics; when it finds an address it is a real, non-loopback IP.
+        if let Some(addr) = detect_local_address() {
+            let ip: std::net::IpAddr = addr.parse().expect("a parseable IP");
+            assert!(!ip.is_loopback(), "should not be loopback: {addr}");
+            assert!(!ip.is_unspecified(), "should not be 0.0.0.0: {addr}");
+        }
     }
 }

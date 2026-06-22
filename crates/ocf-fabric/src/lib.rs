@@ -29,7 +29,7 @@ pub mod wire;
 pub use crypto::{fingerprint, KeyPair, NodeId, PublicKey, SecretKey};
 pub use membership::{Liveness, Membership, MembershipEvent};
 pub use mesh::FabricMesh;
-pub use node::{FabricNode, Reachability};
+pub use node::{detect_local_address, FabricNode, Reachability};
 pub use routing::RouteGraph;
 pub use server::{FabricServer, FabricStreamServer};
 pub use transport::{register_builtins, FabricTransport, NoiseTransport};

@@ -22,6 +22,7 @@ Precedence for the daemon flags is **flag > environment variable > default**.
 | Node id | `--node-id` | `OCF_NODE_ID` | `node-local` | `ocfd` (global) | This node's stable identity in the fleet; also hashed into the Raft node id. |
 | Data directory | `--data-dir` | `OCF_DATA_DIR` | _(unset → in-memory)_ | `ocfd` (global) | Directory for durable state. Unset runs fully in-memory; set persists to `<DIR>/state.redb` and restores on boot. |
 | Seed peers | `--seed` | `OCF_SEEDS` | _(empty)_ | `ocfd` (global) | Comma-separated seed peer(s) (`host:port`) to contact when joining the mesh. |
+| Fabric address | `--fabric-address` | `OCF_FABRIC_ADDRESS` | _(auto-detect)_ | `ocfd` (global) | This node's reachable address peers dial it at (its WireGuard endpoint / control address). Unset auto-detects the host's **primary LAN/route address** (the router-assigned address behind NAT); set it for static setups or when there's no default gateway. |
 | Bind address | `--bind` | `OCF_BIND` | `0.0.0.0:8080` | `ocfd serve` | Socket address the HTTP API binds. |
 | Static dir | `--static-dir` | `OCF_STATIC_DIR` | _(unset)_ | `ocfd serve` | Directory of built frontend assets to serve (e.g. `web/.output/public`). |
 

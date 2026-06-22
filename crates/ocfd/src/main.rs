@@ -26,6 +26,10 @@ struct Cli {
     /// Seed peer(s) to contact when joining the mesh (comma-separated).
     #[arg(long = "seed", env = "OCF_SEEDS", value_delimiter = ',', global = true)]
     seeds: Vec<String>,
+    /// This node's reachable address peers dial it at (its WireGuard endpoint /
+    /// control address). Omit to auto-detect the host's primary LAN/route address.
+    #[arg(long = "fabric-address", env = "OCF_FABRIC_ADDRESS", global = true)]
+    fabric_address: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -60,6 +64,7 @@ async fn main() -> Result<()> {
         node_id: cli.node_id.clone(),
         data_dir: cli.data_dir.clone(),
         seeds: cli.seeds.clone(),
+        fabric_address: cli.fabric_address.clone(),
         ..Default::default()
     };
 

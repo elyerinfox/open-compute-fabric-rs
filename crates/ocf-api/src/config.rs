@@ -13,6 +13,11 @@ pub struct ControllerConfig {
     pub data_dir: Option<PathBuf>,
     /// Seed peers to contact when joining the mesh (`host:port`).
     pub seeds: Vec<String>,
+    /// This node's reachable underlay address (what peers dial it at — its WG
+    /// endpoint and control address). `None` means **auto-detect** the host's
+    /// primary LAN/route address on boot; set it explicitly for static setups or
+    /// when auto-detection can't (no default gateway).
+    pub fabric_address: Option<String>,
     /// Seconds of heartbeat silence before a peer is suspected.
     pub suspect_timeout_secs: i64,
     /// Additional seconds after suspicion before a peer is declared dead.
@@ -32,6 +37,7 @@ impl Default for ControllerConfig {
             node_id: "node-local".to_string(),
             data_dir: None,
             seeds: Vec::new(),
+            fabric_address: None,
             suspect_timeout_secs: 5,
             dead_timeout_secs: 5,
             fabric_control_port: 51900,
