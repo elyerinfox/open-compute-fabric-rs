@@ -21,6 +21,9 @@ pub struct ControllerConfig {
     /// reached over the `wg-mgmt` overlay. Distinct from the WireGuard UDP ports
     /// (51820/51821/51822).
     pub fabric_control_port: u16,
+    /// TCP port the Raft consensus transport listens on (cross-host, over the
+    /// fabric). Distinct from the control and WireGuard ports.
+    pub fabric_raft_port: u16,
 }
 
 impl Default for ControllerConfig {
@@ -32,6 +35,7 @@ impl Default for ControllerConfig {
             suspect_timeout_secs: 5,
             dead_timeout_secs: 5,
             fabric_control_port: 51900,
+            fabric_raft_port: 51901,
         }
     }
 }

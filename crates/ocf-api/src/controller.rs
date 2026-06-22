@@ -22,7 +22,8 @@ use ocf_auth::{Authenticator, LinuxUserSync, LocalAuthenticator};
 use ocf_authz::{Group, RbacEngine, RoleBinding, Subject, User, ADMINISTRATOR_ROLE};
 use ocf_disk::{DiskHealth, DiskService, LedControl, PhysicalDisk, SysfsDiskManager};
 use ocf_fabric::{
-    FabricMesh, FabricNode, FabricTransport, KeyPair, Membership, NodeId, Reachability, RouteGraph,
+    FabricMesh, FabricNode, FabricServer, FabricTransport, KeyPair, Membership, NodeId,
+    NoiseTransport, Reachability, RouteGraph,
 };
 use ocf_health::{HealthCheck, HealthService, PackageCheck};
 use ocf_platform::PlatformService;
@@ -282,16 +283,33 @@ impl FabricController {
             Duration::seconds(config.dead_timeout_secs.max(1)),
         ));
 
-        // Raft-replicated control plane. This node forms (or, with peers, joins)
-        // a cluster whose committed writes are applied into `store`. A
-        // single-node deployment is a quorum of one — every write is still
-        // ordered through the Raft log before it lands.
+        // Raft-replicated control plane, carried over the **encrypted fabric** so a
+        // real cluster forms across hosts. This node's Raft identity is its fabric
+        // identity; it serves inbound Raft RPCs on `fabric_raft_port`.
         let raft_id = raft_node_id(&config.node_id);
-        let consensus = Arc::new(ReplicatedStore::start(raft_id, vec![raft_id], store.clone()).await?);
-        consensus.initialize(vec![raft_id]).await?;
-        consensus
-            .wait_for_leader(std::time::Duration::from_secs(10))
-            .await?;
+        let raft_kp = KeyPair::from_seed_name(&config.node_id);
+        let raft_transport = Arc::new(NoiseTransport::with_keypair(raft_kp.clone()));
+        let raft_server = FabricServer::bind(("0.0.0.0", config.fabric_raft_port), raft_kp).await?;
+        let consensus = Arc::new(
+            ReplicatedStore::start_fabric(raft_id, store.clone(), raft_transport, raft_server).await?,
+        );
+        if config.seeds.is_empty() {
+            // First / standalone node: form a single-voter cluster (quorum of one).
+            // Every write is still ordered through the Raft log; additional nodes
+            // join later via seeds (`join_cluster`), promoted by the leader.
+            let self_addr = format!("127.0.0.1:{}", config.fabric_raft_port);
+            consensus
+                .initialize_cluster(vec![(raft_id, self_addr)])
+                .await?;
+            consensus
+                .wait_for_leader(std::time::Duration::from_secs(10))
+                .await?;
+        } else {
+            tracing::info!(
+                seeds = ?config.seeds,
+                "will join existing Raft cluster via seeds once the fabric is up"
+            );
+        }
 
         let controller = FabricController {
             node_id: config.node_id.clone(),
@@ -326,10 +344,17 @@ impl FabricController {
         if persisted {
             tracing::info!("restoring fabric state from durable store");
             controller.restore().await?;
-        } else {
+        } else if controller.config.seeds.is_empty() {
+            // Standalone / first node: seed the demo fleet (we are the quorum-of-one
+            // leader, so the seeding writes commit).
             tracing::info!("no persisted state; seeding demo fleet");
             controller.seed_demo().await?;
             controller.persist().await?;
+        } else {
+            // Joining node: start empty. Cluster state (including the machine
+            // roster) replicates in from the leader once we're admitted — a learner
+            // has no leader to write through, so we must not seed.
+            tracing::info!("joining a cluster; skipping seed (state replicates from the leader)");
         }
 
         // --- membership / mesh ----------------------------------------------
@@ -762,7 +787,7 @@ impl FabricController {
 
 /// Derive a stable, non-zero numeric Raft node id from the configured node name
 /// (FNV-1a), so each node in a cluster has a distinct id.
-fn raft_node_id(node_id: &str) -> u64 {
+pub(crate) fn raft_node_id(node_id: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in node_id.as_bytes() {
         hash ^= *b as u64;

@@ -61,6 +61,11 @@ pub async fn serve(
     tokio::spawn(controller.clone().run_failure_detector());
     // Start the fabric control channel: ping server + latency prober.
     tokio::spawn(controller.clone().run_latency_services());
+    // A node booted with seeds joins the existing Raft cluster (the leader admits
+    // it); a standalone node already formed its own quorum-of-one at bootstrap.
+    if !controller.config.seeds.is_empty() {
+        tokio::spawn(controller.clone().join_cluster());
+    }
 
     let app = build_app(controller, static_dir);
     let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -164,6 +164,7 @@ What shipped, by date — a heavy, cross-referenced record of each change.
 
 | Entry | Highlights |
 |-------|-----------|
+| [2026-06-22](changelog/2026-06-22.md) | Multi-node Raft over the fabric; cluster formation from seeds; split-brain mitigation (quorum + quorum-gated failure detector) |
 | [2026-06-21](changelog/2026-06-21.md) | SDN egress/IPAM/VXLAN, fleet health, cross-OS packages, streaming + zstd, WireGuard underlays (3 planes), capability placement, latency/reachability/routing, LB ↔ workload association |
 
 ## Conventions used in these docs

@@ -1,16 +1,19 @@
 //! The [`ReplicatedStore`] facade — the public, ergonomic surface over a single
 //! Raft node in the cluster.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ocf_core::prelude::*;
+use ocf_fabric::{FabricServer, NoiseTransport};
 use ocf_store::StateStore;
 use openraft::BasicNode;
 use openraft::Config;
 use openraft::Raft;
+use tokio::sync::OnceCell;
 
+use crate::fabric_net::{serve_raft, FabricRaftNetworkFactory, RaftHandle};
 use crate::network::InProcessNetworkFactory;
 use crate::network::Registry;
 use crate::storage::new_storage;
@@ -93,6 +96,97 @@ impl ReplicatedStore {
             registry,
             store,
         })
+    }
+
+    /// Start a Raft node whose RPCs ride the **encrypted fabric** (cross-host),
+    /// instead of the in-process router. `transport` carries this node's Noise
+    /// identity; `server` is a bound [`FabricServer`] that this call begins serving
+    /// inbound Raft RPCs on. Use [`initialize_cluster`](Self::initialize_cluster) /
+    /// [`add_learner`](Self::add_learner) / [`change_membership`](Self::change_membership)
+    /// to form the cluster, addressing peers by their fabric endpoints.
+    pub async fn start_fabric(
+        node_id: u64,
+        store: Arc<dyn StateStore>,
+        transport: Arc<NoiseTransport>,
+        server: FabricServer,
+    ) -> Result<Self> {
+        // Wider election timing than the in-process cluster: real RPCs cross an
+        // encrypted network, so allow more slack before calling an election.
+        let config = Config {
+            cluster_name: "ocf-consensus".to_string(),
+            heartbeat_interval: 250,
+            election_timeout_min: 1500,
+            election_timeout_max: 3000,
+            ..Default::default()
+        };
+        let config = Arc::new(
+            config
+                .validate()
+                .map_err(|e| Error::internal(format!("invalid raft config: {e}")))?,
+        );
+
+        let (log_store, state_machine) = new_storage(store.clone());
+        let network = FabricRaftNetworkFactory::new(transport);
+        let raft = Raft::new(node_id, config, network, log_store, state_machine)
+            .await
+            .map_err(|e| Error::internal(format!("failed to start raft node {node_id}: {e}")))?;
+
+        // Publish the handle so the server can dispatch inbound RPCs to it.
+        let cell: RaftHandle = Arc::new(OnceCell::new());
+        let _ = cell.set(raft.clone());
+        tokio::spawn(serve_raft(server, cell));
+
+        Ok(Self {
+            node_id,
+            raft,
+            registry: Registry::new(), // unused on the fabric path
+            store,
+        })
+    }
+
+    /// Initialize a fabric cluster with `members` (id → fabric endpoint). Call on
+    /// exactly one node; idempotent. Peers address each other by these endpoints.
+    pub async fn initialize_cluster(&self, members: Vec<(u64, String)>) -> Result<()> {
+        let nodes: BTreeMap<u64, BasicNode> = members
+            .into_iter()
+            .map(|(id, addr)| (id, BasicNode::new(addr)))
+            .collect();
+        match self.raft.initialize(nodes).await {
+            Ok(()) => Ok(()),
+            Err(e) if is_already_initialized(&e) => Ok(()),
+            Err(e) => Err(Error::internal(format!("initialize cluster: {e}"))),
+        }
+    }
+
+    /// Add `id` (reachable at fabric endpoint `addr`) as a learner — the leader
+    /// streams it the log/snapshot until it catches up. Leader-only.
+    pub async fn add_learner(&self, id: u64, addr: String) -> Result<()> {
+        self.raft
+            .add_learner(id, BasicNode::new(addr), true)
+            .await
+            .map_err(|e| Error::internal(format!("add_learner {id}: {e}")))?;
+        Ok(())
+    }
+
+    /// Set the cluster's voter set (promotes caught-up learners / drops members).
+    /// Leader-only; the change is itself committed by a quorum.
+    pub async fn change_membership(&self, voters: BTreeSet<u64>) -> Result<()> {
+        self.raft
+            .change_membership(voters, false)
+            .await
+            .map_err(|e| Error::internal(format!("change_membership: {e}")))?;
+        Ok(())
+    }
+
+    /// The current voter ids in the committed membership config.
+    pub fn voters(&self) -> Vec<u64> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
     }
 
     /// Initialize the cluster with `members` (id -> address). Call this on
@@ -212,6 +306,102 @@ impl ReplicatedStore {
     /// e.g. asserting replication landed in tests).
     pub fn state_store(&self) -> Arc<dyn StateStore> {
         self.store.clone()
+    }
+}
+
+#[cfg(test)]
+mod fabric_cluster_tests {
+    use super::*;
+    use ocf_fabric::KeyPair;
+    use ocf_store::MemoryStateStore;
+
+    /// Bring up one Raft node served over a real loopback Noise/TCP fabric
+    /// endpoint, the way the daemon does. Returns the store and its fabric address.
+    async fn start_node(id: u64) -> (ReplicatedStore, String) {
+        let kp = KeyPair::generate();
+        let server = FabricServer::bind("127.0.0.1:0", kp.clone())
+            .await
+            .expect("bind");
+        let addr = server.local_addr().to_string();
+        let transport = Arc::new(NoiseTransport::with_keypair(kp));
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let rs = ReplicatedStore::start_fabric(id, store, transport, server)
+            .await
+            .expect("start_fabric");
+        (rs, addr)
+    }
+
+    #[tokio::test]
+    async fn fabric_cluster_forms_and_replicates() {
+        let (n1, a1) = start_node(1).await;
+        let (n2, a2) = start_node(2).await;
+        let (n3, a3) = start_node(3).await;
+        n1.initialize_cluster(vec![(1, a1), (2, a2), (3, a3)])
+            .await
+            .expect("init cluster");
+        let leader_id = n1.wait_for_leader(Duration::from_secs(10)).await.expect("leader");
+
+        let nodes = [&n1, &n2, &n3];
+        let leader = nodes.iter().find(|n| n.node_id() == leader_id).unwrap();
+        leader.put("kv", "k1", b"v1".to_vec()).await.expect("write on leader");
+
+        // The write replicates to every node's state machine.
+        for n in nodes {
+            let mut ok = false;
+            for _ in 0..60 {
+                if n.get("kv", "k1").unwrap() == Some(b"v1".to_vec()) {
+                    ok = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(ok, "node {} did not replicate the write", n.node_id());
+        }
+        for n in [n1, n2, n3] {
+            n.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn follower_write_is_redirected_not_a_second_authority() {
+        let (n1, a1) = start_node(1).await;
+        let (n2, a2) = start_node(2).await;
+        let (n3, a3) = start_node(3).await;
+        n1.initialize_cluster(vec![(1, a1), (2, a2), (3, a3)])
+            .await
+            .expect("init");
+        let leader_id = n1.wait_for_leader(Duration::from_secs(10)).await.expect("leader");
+        let follower = [&n1, &n2, &n3]
+            .into_iter()
+            .find(|n| n.node_id() != leader_id)
+            .unwrap();
+        // A follower refuses the write (redirects to the leader) — there is never
+        // a second writer.
+        assert!(follower.put("kv", "x", b"y".to_vec()).await.is_err());
+        for n in [n1, n2, n3] {
+            n.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn minority_partition_cannot_commit() {
+        let (n1, a1) = start_node(1).await;
+        // A 3-member cluster whose other two members are unreachable: node 1 is a
+        // minority and can never gather a quorum.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            n1.initialize_cluster(vec![
+                (1, a1),
+                (2, "127.0.0.1:9".to_string()),
+                (3, "127.0.0.1:10".to_string()),
+            ]),
+        )
+        .await;
+        // No quorum → no leader is elected and writes cannot commit. This is the
+        // split-brain guarantee: a partitioned minority is inert.
+        assert!(n1.wait_for_leader(Duration::from_secs(2)).await.is_err());
+        assert!(n1.put("kv", "k", b"v".to_vec()).await.is_err());
+        n1.shutdown().await;
     }
 }
 

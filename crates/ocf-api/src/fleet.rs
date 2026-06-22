@@ -16,8 +16,17 @@ use std::collections::BTreeMap;
 
 use ocf_core::prelude::*;
 use ocf_fabric::{
-    FabricServer, KeyPair, Liveness, MembershipEvent, NoiseTransport, NodeId, Reachability,
+    FabricNode, FabricServer, KeyPair, Liveness, MembershipEvent, NoiseTransport, NodeId,
+    Reachability,
 };
+
+/// A node's request to be admitted to the Raft cluster, sent to a seed's control
+/// channel as `join <json>`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct JoinRequest {
+    raft_id: u64,
+    raft_addr: String,
+}
 use ocf_loadbalancer::{Backend, LoadBalancer};
 use ocf_runtime::Workload;
 use ocf_topology::Machine;
@@ -206,15 +215,18 @@ impl FabricController {
     /// real fleet.
     pub async fn run_latency_services(self: Arc<Self>) {
         let port = self.config.fabric_control_port;
-        let membership = self.membership.clone();
+        let ctl = self.clone();
         match FabricServer::bind(("0.0.0.0", port), self.node_keypair()).await {
             Ok(srv) => {
                 tokio::spawn(srv.run(move |_pk, req| {
-                    let membership = membership.clone();
+                    let ctl = ctl.clone();
                     async move {
                         if req == b"latency" {
                             // Share our measured latencies so peers can build the graph.
-                            serde_json::to_vec(&membership.latency_snapshot()).unwrap_or_default()
+                            serde_json::to_vec(&ctl.membership.latency_snapshot()).unwrap_or_default()
+                        } else if let Some(body) = req.strip_prefix(b"join ") {
+                            // A node asking to join the Raft cluster.
+                            ctl.handle_join(body).await
                         } else {
                             req // `ping` → echo (for RTT timing)
                         }
@@ -250,6 +262,88 @@ impl FabricController {
                             .write()
                             .insert(member.node.node_id.clone(), map);
                     }
+                }
+            }
+        }
+    }
+
+    /// This node's Raft endpoint other nodes dial it on — its `wg-mgmt` overlay
+    /// address (so Raft rides the encrypted management plane and reaches NAT'd
+    /// nodes), plus the Raft port.
+    pub(crate) async fn raft_endpoint(&self) -> String {
+        let plan = self.machine_plan().await;
+        let ip = plan
+            .iter()
+            .find(|(_, name, _, _)| name == &self.node_id)
+            .map(|(_, _, i, _)| WG_MGMT.ip(*i))
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        format!("{ip}:{}", self.config.fabric_raft_port)
+    }
+
+    /// Handle an inbound `join` request from a node that wants into the Raft
+    /// cluster. Only the **leader** can change membership: it adds the joiner as a
+    /// learner (catch-up) then promotes it to a voter. A non-leader replies
+    /// `notleader` so the joiner tries another seed.
+    async fn handle_join(&self, body: &[u8]) -> Vec<u8> {
+        let req: JoinRequest = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(_) => return b"error".to_vec(),
+        };
+        if !self.consensus.is_leader() {
+            return b"notleader".to_vec();
+        }
+        if let Err(e) = self.consensus.add_learner(req.raft_id, req.raft_addr.clone()).await {
+            tracing::warn!(error = %e, raft_id = req.raft_id, "join: add_learner failed");
+            return b"error".to_vec();
+        }
+        let mut voters: std::collections::BTreeSet<u64> =
+            self.consensus.voters().into_iter().collect();
+        voters.insert(req.raft_id);
+        if let Err(e) = self.consensus.change_membership(voters).await {
+            tracing::warn!(error = %e, raft_id = req.raft_id, "join: change_membership failed");
+            return b"error".to_vec();
+        }
+        tracing::info!(raft_id = req.raft_id, addr = %req.raft_addr, "admitted node to the Raft cluster");
+        b"ok".to_vec()
+    }
+
+    /// Join an existing Raft cluster via the configured seeds: advertise this
+    /// node's Raft endpoint to each seed's control channel until the leader admits
+    /// it. Spawned on a task for a node that booted with `seeds` set. Best-effort
+    /// with retry; the leader's `change_membership` is itself quorum-committed, so
+    /// joining can't create a second authority.
+    pub async fn join_cluster(self: Arc<Self>) {
+        let raft_id = crate::controller::raft_node_id(&self.node_id);
+        let addr = self.raft_endpoint().await;
+        let request = match serde_json::to_vec(&JoinRequest {
+            raft_id,
+            raft_addr: addr.clone(),
+        }) {
+            Ok(b) => {
+                let mut p = b"join ".to_vec();
+                p.extend_from_slice(&b);
+                p
+            }
+            Err(_) => return,
+        };
+        let client = NoiseTransport::with_keypair(self.node_keypair());
+        let mut interval = tokio::time::interval(StdDuration::from_secs(3));
+        loop {
+            interval.tick().await;
+            for seed in &self.config.seeds {
+                let seed_node = FabricNode::new(
+                    NodeId::new(seed.clone()),
+                    ocf_fabric::PublicKey::from_bytes(Vec::new()),
+                    vec![seed.clone()],
+                );
+                match client.request(&seed_node, &request).await {
+                    Ok(resp) if resp == b"ok" => {
+                        tracing::info!(%addr, "joined Raft cluster via seed {seed}");
+                        return;
+                    }
+                    Ok(resp) if resp == b"notleader" => continue, // try the next seed
+                    Ok(_) => continue,
+                    Err(_) => continue, // seed unreachable; retry
                 }
             }
         }
@@ -378,7 +472,23 @@ impl FabricController {
     }
 
     /// Map a dead node id back to its machine and run drop-out handling.
+    ///
+    /// **Quorum-gated:** only the Raft **leader** auto-reschedules. In a network
+    /// partition each side's failure detector fires, but a minority partition has
+    /// no leader (Raft needs a quorum to elect one), so it does nothing — exactly
+    /// one node, in the majority, performs the reschedule. This is what stops two
+    /// partition halves from both restarting the same HA workload (split-brain).
+    /// A quorum-of-one node is always its own leader, so the single-node path is
+    /// unaffected.
     async fn on_node_dead(&self, node_id: &NodeId) {
+        if !self.consensus.is_leader() {
+            tracing::warn!(
+                node = %node_id,
+                leader = ?self.consensus.leader(),
+                "peer dead but this node is not the Raft leader — deferring reschedule to the leader"
+            );
+            return;
+        }
         let machine_id = self
             .membership
             .members()

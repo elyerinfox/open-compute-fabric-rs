@@ -231,6 +231,47 @@ The peer's static key is learned during the Noise XX handshake, so a
 `FabricRaftNetwork` only needs the endpoint address to dial — `peer_node()`
 constructs a `FabricNode` with an empty public key.
 
+## Cluster formation & split-brain
+
+The **daemon** runs Raft over the cross-host fabric transport
+(`ReplicatedStore::start_fabric` builds the node with a `FabricRaftNetworkFactory`
+and serves inbound RPCs on `fabric_raft_port`). Raft RPCs ride the encrypted
+`wg-mgmt` plane, so even a NAT'd node participates.
+
+**Forming / joining (`ocf-api`):**
+
+- **No seeds** → the node `initialize_cluster([self])` — a **quorum of one**. It is
+  its own leader; every write is still ordered through the Raft log. (The demo and
+  single-host deployments use this path.)
+- **With seeds** → the node starts **empty** (it must not seed — a learner has no
+  leader to write through) and `join_cluster` advertises its Raft endpoint to each
+  seed's control channel (`join <json>`). The seed, **if it is the leader**, runs
+  `add_learner` (catch-up) then `change_membership` to promote it to a voter; a
+  non-leader replies `notleader` so the joiner tries another seed. State then
+  replicates in from the leader.
+
+**Split-brain mitigations:**
+
+1. **Quorum on every write.** A command commits only once a majority acks it, so a
+   minority partition **cannot commit** — it has no leader to write through. Proven
+   in `minority_partition_cannot_commit` (a 3-member node alone never elects a
+   leader and its writes fail) and `follower_write_is_redirected_…` (a follower
+   refuses writes, so there is never a second writer).
+2. **Quorum-gated failure detector.** Drop-out handling
+   ([`ocf-api`](ocf-api.md#membership-failure-detector--ha-reschedule)) only
+   reschedules HA workloads **if this node is the Raft leader** (`on_node_dead`
+   checks `is_leader()`). In a partition each side's detector fires, but only the
+   majority side has a leader — so exactly one node reschedules, and two halves
+   can't both restart the same workload.
+
+> Honest scope: the **seed-join admission flow** and **NAT'd-node Raft over
+> `wg-mgmt`** are exercised on a real multi-host fleet, not the single-host CI; the
+> cluster mechanics themselves (form, replicate, redirect, minority-inert) are
+> proven on a 3-node loopback cluster through the same `start_fabric` path the
+> daemon uses. A joining node that has caught up does not yet re-derive its
+> membership/WireGuard view from the replicated roster — that re-sync is the next
+> step.
+
 ## Diagrams
 
 ### A `put()` going through Raft
