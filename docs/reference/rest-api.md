@@ -54,6 +54,9 @@ handler is a thin adapter that borrows one subsystem off the
 | `GET` | `/api/v1/health/findings` | Health | Fleet-health findings for this node (problems + fixes) |
 | `POST` | `/api/v1/health/fix` | Health | Apply a finding's fix action |
 | `GET` | `/api/v1/platform` | Health | Host OS, package manager, and per-capability readiness |
+| `GET` | `/api/v1/platform/updates` | Health | Pending OS package updates (+ security count) |
+| `POST` | `/api/v1/platform/updates/apply` | Health | Apply pending updates (`{security_only}`) |
+| `GET` | `/api/v1/platform/vulnerabilities` | Health | Installed packages matching the OSV database |
 
 ## Endpoints by subsystem
 
@@ -1127,6 +1130,48 @@ each missing one). See [`ocf-platform`](../subsystems/ocf-platform.md).
     { "name": "openvswitch", "binary": "ovs-vsctl", "present": false, "package": "openvswitch-switch" }
   ]
 }
+```
+
+### `GET /api/v1/platform/updates`
+
+Pending OS package updates, with how many are **security** updates. `manager` is
+`null` on a host with no supported package manager (then `total`/`security` are 0).
+
+```json
+{
+  "manager": "apt",
+  "total": 12,
+  "security": 3,
+  "updates": [
+    { "name": "openssl", "current_version": "3.0.2-0ubuntu1.10",
+      "available_version": "3.0.2-0ubuntu1.15", "security": true }
+  ]
+}
+```
+
+### `POST /api/v1/platform/updates/apply`
+
+Apply pending updates. Body `{ "security_only": true }` installs only security
+updates (apt/dnf); `false` (or omitted) applies all. Needs root on the host.
+
+```json
+{ "applied": "Applied 3 security update(s) via apt-get." }
+```
+
+`409`/`500` with a clear message when there's no package manager or the command
+fails (no root, etc.).
+
+### `GET /api/v1/platform/vulnerabilities`
+
+Installed packages that match a known vulnerability in the **OSV** database
+([osv.dev](https://osv.dev)). Empty when there's no package manager, the distro
+isn't tracked by OSV, or nothing installed is known-vulnerable.
+
+```json
+[
+  { "name": "openssl", "version": "3.0.2-0ubuntu1.10",
+    "vuln_ids": ["CVE-2022-0778", "OSV-2022-189"] }
+]
 ```
 
 On a host with no supported package manager (e.g. Windows), `active_manager` is

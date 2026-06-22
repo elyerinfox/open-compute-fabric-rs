@@ -34,7 +34,7 @@ pub mod service;
 pub use check::HealthCheck;
 pub use checks::{
     BridgeNetfilterCheck, DockerExperimentalCheck, IpForwardingCheck, NetfilterCheck, PackageCheck,
-    ServiceCheck, SwapCheck, SysctlCheck, TimeSyncCheck,
+    SecurityUpdateCheck, ServiceCheck, SwapCheck, SysctlCheck, TimeSyncCheck, VulnerabilityCheck,
 };
 pub use finding::{FixAction, HealthCategory, HealthFinding, Severity};
 pub use service::HealthService;

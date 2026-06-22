@@ -7,6 +7,8 @@ pub mod docker;
 pub mod ip_forwarding;
 pub mod netfilter;
 pub mod package;
+pub mod security_update;
+pub mod vulnerability;
 
 pub use bridge_netfilter::BridgeNetfilterCheck;
 pub use config::{ServiceCheck, SwapCheck, SysctlCheck, TimeSyncCheck};
@@ -14,3 +16,5 @@ pub use docker::DockerExperimentalCheck;
 pub use ip_forwarding::IpForwardingCheck;
 pub use netfilter::NetfilterCheck;
 pub use package::PackageCheck;
+pub use security_update::SecurityUpdateCheck;
+pub use vulnerability::VulnerabilityCheck;

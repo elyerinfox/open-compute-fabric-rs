@@ -121,6 +121,42 @@ flowchart TD
     pm -->|"pacman (Arch)"| map3["pacman -S --noconfirm nftables"]
 ```
 
+## Package updates & vulnerability scanning
+
+Beyond installing a missing tool, the `PackageManager` contract handles **updates**
+and feeds **vulnerability scanning**:
+
+| Method | What it does |
+|--------|-------------|
+| `list_updates()` | Refreshes the cache (best-effort) and lists pending updates as `PackageUpdate { name, current_version, available_version, security }`. apt and dnf flag **security** updates (apt by the `…-security` suite; dnf via `updateinfo list security`); pacman/apk roll everything together. |
+| `apply_updates(security_only)` | Applies updates — `apt-get upgrade` / `dnf upgrade`, or security-only (`apt-get install --only-upgrade <sec-pkgs>` / `dnf upgrade --security`) where supported. Needs root. |
+| `list_installed_packages()` | Every installed `name@version` — the input to OSV. |
+| `osv_ecosystem(os)` | Maps the host to its OSV ecosystem (`"Ubuntu"`, `"Debian"`, `"Red Hat"`, `"Alpine"`; `None` for Arch, which OSV doesn't track). |
+
+The parsing of each tool's output lives in `update.rs` as **pure, unit-tested**
+functions, so a host without that package manager is irrelevant to testing.
+
+`PlatformService` exposes `available_updates()` (with a security count),
+`apply_updates(security_only)`, and **`scan_vulnerabilities()`**.
+
+### OSV vulnerability scanning
+
+`OsvClient` (`osv.rs`) queries the public **[OSV](https://osv.dev) batch API**
+(`POST https://api.osv.dev/v1/querybatch`) with the host's installed packages in
+their distro ecosystem, chunked to OSV's 1000-per-request limit. Results map
+positionally to the queries; a package with a non-empty `vulns` array becomes a
+`VulnerablePackage { name, version, vuln_ids }`. The request build and response
+parse are pure/tested; the HTTP call is a blocking `ureq` (rustls) request run on
+a blocking thread, so no network simply yields an error and the fabric keeps
+running.
+
+```mermaid
+flowchart LR
+    inst["list_installed_packages()<br/>(dpkg / rpm / apk)"] --> osv["OsvClient.scan(pkgs, ecosystem)"]
+    osv -->|querybatch| api[("api.osv.dev")]
+    api --> rep["VulnerablePackage[]<br/>name@version → CVE/OSV ids"]
+```
+
 ## Integration with health
 
 This crate is what makes [`ocf-health`](ocf-health.md)'s **`PackageCheck`**
@@ -152,6 +188,14 @@ sequenceDiagram
 | Method | Path | Returns |
 |--------|------|---------|
 | `GET` | `/api/v1/platform` | `PlatformStatus`: OS, active manager, per-capability readiness |
+| `GET` | `/api/v1/platform/updates` | `UpdateSummary`: pending updates + a security count |
+| `POST` | `/api/v1/platform/updates/apply` | Apply updates (`{ "security_only": bool }`) |
+| `GET` | `/api/v1/platform/vulnerabilities` | `VulnerablePackage[]` from the OSV scan |
+
+Security posture is also surfaced as **health findings** — a `SecurityUpdateCheck`
+(Warning when security updates are pending, with *Apply security updates* / *Apply
+all updates* fixes) and a `VulnerabilityCheck` (Critical, listing OSV-flagged
+packages) — see [ocf-health](ocf-health.md).
 
 Package managers also appear in `GET /api/v1/providers` (and `ocfd providers`)
 under the `PackageManager` contract. The install fixes themselves are driven

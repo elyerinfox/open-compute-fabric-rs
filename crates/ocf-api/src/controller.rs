@@ -274,6 +274,15 @@ impl FabricController {
                 ocf_platform::builtin_capabilities(),
             )),
         )?;
+        // Security posture: pending (security) updates + OSV vulnerability scan.
+        health_reg.register(
+            "security-updates",
+            Arc::new(ocf_health::SecurityUpdateCheck::new(platform.clone())),
+        )?;
+        health_reg.register(
+            "vulnerabilities",
+            Arc::new(ocf_health::VulnerabilityCheck::new(platform.clone())),
+        )?;
         let health = HealthService::new(health_reg);
         let loadbalancers = LoadBalancerController::new();
 

@@ -98,6 +98,8 @@ refuses unknown fix ids.
 | `bridge-netfilter` | network | `/proc/sys/net/bridge/bridge-nf-call-iptables` ≠ `1` (or absent) | `enable-bridge-nf` → `modprobe br_netfilter` + set `1` |
 | `docker-experimental` | runtime | `docker info --format '{{.ExperimentalBuild}}'` ≠ `true` | `enable-docker-experimental` → merge `experimental:true` into `/etc/docker/daemon.json`, `systemctl restart docker` |
 | `packages` | other | each required tool's binary missing from `PATH` | `install-<cap>` → install via the host's package manager ([`ocf-platform`](ocf-platform.md)) |
+| `security-updates` | security | pending OS package updates (Warning when any are security) | `apply-security-updates` / `apply-all-updates` |
+| `vulnerabilities` | security | installed packages matching the **OSV** database (Critical) | `apply-all-updates` → pull in fixes |
 
 Each lives in its own `checks/<name>.rs` — that file is the whole warning:
 detection probe, finding text, fix action, and remediation.

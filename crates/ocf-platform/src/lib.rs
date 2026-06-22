@@ -27,16 +27,20 @@
 pub mod capability;
 pub mod managers;
 pub mod os;
+pub mod osv;
 pub mod package;
 pub mod service;
+pub mod update;
 
 pub use capability::{builtin_capabilities, Capability};
 pub use managers::{
     ApkPackageManager, AptPackageManager, DnfPackageManager, PacmanPackageManager,
 };
 pub use os::{binary_available, HostOs};
+pub use osv::{OsvClient, VulnerablePackage};
 pub use package::{register_builtins, PackageManager};
-pub use service::{CapabilityStatus, PlatformService, PlatformStatus};
+pub use service::{CapabilityStatus, PlatformService, PlatformStatus, UpdateSummary};
+pub use update::{InstalledPackage, PackageUpdate};
 
 #[cfg(test)]
 mod tests {

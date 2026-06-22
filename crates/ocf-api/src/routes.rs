@@ -55,6 +55,9 @@ pub fn api_router(controller: Arc<FabricController>) -> Router {
         .route("/api/v1/health/findings", get(health_findings))
         .route("/api/v1/health/fix", post(health_fix))
         .route("/api/v1/platform", get(platform_status))
+        .route("/api/v1/platform/updates", get(platform_updates))
+        .route("/api/v1/platform/updates/apply", post(platform_apply_updates))
+        .route("/api/v1/platform/vulnerabilities", get(platform_vulnerabilities))
         .route("/api/v1/access/users", get(users))
         .route("/api/v1/access/roles", get(roles))
         .route("/api/v1/access/groups", get(groups))
@@ -344,6 +347,36 @@ struct HealthFixBody {
 /// package that would install each missing one).
 async fn platform_status(State(c): Ctrl) -> Json<ocf_platform::PlatformStatus> {
     Json(c.platform.status(&ocf_platform::builtin_capabilities()))
+}
+
+/// `GET /api/v1/platform/updates` — pending OS package updates, with a count of
+/// the security ones.
+async fn platform_updates(State(c): Ctrl) -> ApiResult<Json<ocf_platform::UpdateSummary>> {
+    Ok(Json(c.platform.available_updates().await?))
+}
+
+/// `POST /api/v1/platform/updates/apply` — apply pending updates. Body
+/// `{ "security_only": true }` restricts to security updates (apt/dnf).
+async fn platform_apply_updates(
+    State(c): Ctrl,
+    Json(body): Json<ApplyUpdatesBody>,
+) -> ApiResult<Json<Value>> {
+    let outcome = c.platform.apply_updates(body.security_only).await?;
+    Ok(Json(json!({ "applied": outcome })))
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyUpdatesBody {
+    #[serde(default)]
+    security_only: bool,
+}
+
+/// `GET /api/v1/platform/vulnerabilities` — installed packages that match a known
+/// vulnerability in the OSV database.
+async fn platform_vulnerabilities(
+    State(c): Ctrl,
+) -> ApiResult<Json<Vec<ocf_platform::VulnerablePackage>>> {
+    Ok(Json(c.platform.scan_vulnerabilities().await?))
 }
 
 async fn users(State(c): Ctrl) -> Json<Vec<ocf_authz::User>> {

@@ -1,6 +1,7 @@
 //! The pluggable package-manager contract and shared command helpers.
 
 use crate::os::HostOs;
+use crate::update::{InstalledPackage, PackageUpdate};
 use ocf_core::prelude::*;
 use tokio::process::Command;
 
@@ -22,6 +23,38 @@ pub trait PackageManager: Provider {
     /// Install `package`, returning a human-readable outcome. Typically needs
     /// root; a permission/other failure surfaces as a provider error.
     async fn install(&self, package: &str) -> Result<String>;
+
+    /// The available package updates on this host (refreshing the cache best-effort
+    /// first). Empty when none, the tool is absent, or updates aren't supported.
+    /// Security updates carry `security == true` where the manager distinguishes
+    /// them (apt, dnf).
+    async fn list_updates(&self) -> Result<Vec<PackageUpdate>> {
+        Ok(Vec::new())
+    }
+
+    /// Apply pending updates. `security_only` restricts to security updates on
+    /// managers that support it (apt, dnf); others apply all updates. Needs root.
+    async fn apply_updates(&self, security_only: bool) -> Result<String> {
+        let _ = security_only;
+        Err(Error::unsupported(format!(
+            "`{}` does not support applying updates",
+            self.name()
+        )))
+    }
+
+    /// Every installed package and its version — the input to vulnerability
+    /// scanning. Empty when the query tool is absent.
+    async fn list_installed_packages(&self) -> Result<Vec<InstalledPackage>> {
+        Ok(Vec::new())
+    }
+
+    /// The OSV ecosystem for this manager's packages (`"Debian"`, `"Ubuntu"`,
+    /// `"Alpine"`, …), used to query the OSV database. `None` when OSV doesn't
+    /// cover it (e.g. Arch).
+    fn osv_ecosystem(&self, os: &HostOs) -> Option<String> {
+        let _ = os;
+        None
+    }
 }
 
 /// Run `cmd args...`, returning `(ran, success, stdout, stderr)`. A missing

@@ -3,9 +3,24 @@
 
 use crate::capability::Capability;
 use crate::os::HostOs;
+use crate::osv::{OsvClient, VulnerablePackage};
 use crate::package::{register_builtins, PackageManager};
+use crate::update::{InstalledPackage, PackageUpdate};
 use ocf_core::prelude::*;
 use std::sync::Arc;
+
+/// A summary of the host's pending package updates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSummary {
+    /// The active package manager, or `None` on a host with none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manager: Option<String>,
+    /// Total pending updates.
+    pub total: usize,
+    /// How many of them are **security** updates.
+    pub security: usize,
+    pub updates: Vec<PackageUpdate>,
+}
 
 /// Per-capability status, for the API / dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +113,65 @@ impl PlatformService {
             ))
         })?;
         pm.install(package).await
+    }
+
+    /// Pending package updates on this host, with a count of security ones.
+    /// Empty (manager `None`) on a host with no supported package manager.
+    pub async fn available_updates(&self) -> Result<UpdateSummary> {
+        let Some(pm) = self.active_manager() else {
+            return Ok(UpdateSummary {
+                manager: None,
+                total: 0,
+                security: 0,
+                updates: Vec::new(),
+            });
+        };
+        let updates = pm.list_updates().await.unwrap_or_default();
+        let security = updates.iter().filter(|u| u.security).count();
+        Ok(UpdateSummary {
+            manager: Some(pm.name().to_string()),
+            total: updates.len(),
+            security,
+            updates,
+        })
+    }
+
+    /// Apply pending updates (optionally `security_only`). Errors without a
+    /// supported package manager. Needs root on the host.
+    pub async fn apply_updates(&self, security_only: bool) -> Result<String> {
+        let pm = self.active_manager().ok_or_else(|| {
+            Error::unsupported(format!(
+                "no supported package manager for host OS `{}`",
+                self.os.os
+            ))
+        })?;
+        pm.apply_updates(security_only).await
+    }
+
+    /// Every installed package and version (for vulnerability scanning).
+    pub async fn installed_packages(&self) -> Result<Vec<InstalledPackage>> {
+        match self.active_manager() {
+            Some(pm) => pm.list_installed_packages().await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Scan this host's installed packages against the **OSV** database. Empty
+    /// when there's no package manager, OSV doesn't track this distro, or nothing
+    /// installed is known-vulnerable.
+    pub async fn scan_vulnerabilities(&self) -> Result<Vec<VulnerablePackage>> {
+        let Some(pm) = self.active_manager() else {
+            return Ok(Vec::new());
+        };
+        let Some(ecosystem) = pm.osv_ecosystem(&self.os) else {
+            return Ok(Vec::new());
+        };
+        let packages = pm.list_installed_packages().await.unwrap_or_default();
+        if packages.is_empty() {
+            return Ok(Vec::new());
+        }
+        tracing::info!(count = packages.len(), %ecosystem, "scanning packages against OSV");
+        OsvClient::new().scan(&packages, &ecosystem).await
     }
 
     /// A status snapshot over `caps` for the API/dashboard.

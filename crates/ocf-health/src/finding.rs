@@ -34,6 +34,8 @@ pub enum HealthCategory {
     Network,
     Runtime,
     Storage,
+    /// Security posture — pending security updates, known-vulnerable packages.
+    Security,
     Other,
 }
 

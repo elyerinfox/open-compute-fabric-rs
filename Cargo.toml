@@ -51,6 +51,7 @@ ocf-platform = { path = "crates/ocf-platform" }
 # Third-party
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ureq = { version = "2", features = ["json"] }
 async-trait = "0.1"
 thiserror = "1"
 uuid = { version = "1", features = ["v4", "serde"] }

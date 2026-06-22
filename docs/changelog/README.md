@@ -6,7 +6,7 @@ reference docs for full detail.
 
 | Date | Highlights |
 |------|-----------|
-| [2026-06-22](2026-06-22.md) | Multi-node Raft over the encrypted fabric (cross-host cluster formation from seeds) and split-brain mitigation (quorum on writes + a quorum-gated failure detector) |
+| [2026-06-22](2026-06-22.md) | Multi-node Raft over the encrypted fabric (cross-host cluster formation from seeds) and split-brain mitigation (quorum on writes + a quorum-gated failure detector); a package-update handler, security-update warnings, and OSV vulnerability scanning |
 | [2026-06-21](2026-06-21.md) | SDN egress/IPAM/cross-host VXLAN; fleet health + fixes (`ocf-health`); cross-OS package management (`ocf-platform`); bulk streaming transport + zstd; encrypted WireGuard underlays split into three isolated planes (`wg-mgmt`/`wg-data`/`wg-lb`) with control unified over `wg-mgmt`; capability-based placement; measured latency, reachability, relays, and weighted routing; live LB ↔ workload/autoscaling-group association |
 
 For the per-subsystem deep dives, see [`../subsystems/`](../subsystems/); for the
