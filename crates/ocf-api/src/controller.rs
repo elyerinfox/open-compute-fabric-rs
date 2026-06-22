@@ -167,6 +167,8 @@ pub(crate) fn plan_wg_peers(
 pub struct FabricController {
     pub config: ControllerConfig,
     pub node_id: String,
+    /// This node's friendly display name (the hostname by default).
+    pub node_name: String,
     pub store: Arc<dyn StateStore>,
     /// Raft-replicated control plane. Writes go through `consensus` (committed by
     /// a quorum, then applied into `store`); reads come from `store`.
@@ -322,6 +324,7 @@ impl FabricController {
 
         let controller = FabricController {
             node_id: config.node_id.clone(),
+            node_name: config.node_name.clone(),
             config,
             store,
             consensus,

@@ -98,6 +98,71 @@ impl FabricNode {
     }
 }
 
+/// The host's stable machine id from the OS (`/etc/machine-id`, falling back to
+/// `/var/lib/dbus/machine-id`), if present. This is a unique, reboot-stable id
+/// independent of hostname — ideal as a node's permanent fabric identity.
+pub fn detect_machine_id() -> Option<String> {
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let id = contents.trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The host's name, for a **friendly** node label (not its identity). Tries the
+/// `HOSTNAME`/`COMPUTERNAME` env, then `/etc/hostname`, then the kernel hostname.
+pub fn detect_hostname() -> Option<String> {
+    for var in ["HOSTNAME", "COMPUTERNAME"] {
+        if let Ok(h) = std::env::var(var) {
+            let h = h.trim();
+            if !h.is_empty() {
+                return Some(h.to_string());
+            }
+        }
+    }
+    for path in ["/etc/hostname", "/proc/sys/kernel/hostname"] {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let h = contents.trim();
+            if !h.is_empty() {
+                return Some(h.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve this node's stable, **unique** identity **without the operator naming
+/// it**: an explicit override → the OS machine id → a UUID generated once and
+/// persisted under the data directory → the hostname. The result is what derives
+/// the node's keypair, Raft id, and membership id, so it must be stable across
+/// reboots and unique per host.
+pub fn resolve_machine_id(explicit: Option<String>, data_dir: Option<&std::path::Path>) -> String {
+    if let Some(id) = explicit.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        return id;
+    }
+    if let Some(id) = detect_machine_id() {
+        return id;
+    }
+    if let Some(dir) = data_dir {
+        let path = dir.join("machine-id");
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            let id = existing.trim();
+            if !id.is_empty() {
+                return id.to_string();
+            }
+        }
+        let generated = uuid::Uuid::new_v4().to_string();
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(&path, &generated);
+        return generated;
+    }
+    detect_hostname().unwrap_or_else(|| "node".to_string())
+}
+
 /// Best-effort detection of this host's primary reachable IPv4 — the source
 /// address the kernel would use toward the default route. This is the
 /// **router-assigned LAN address** on a host behind a home/office router
@@ -136,6 +201,20 @@ mod tests {
         let node = FabricNode::from_keypair(&kp, vec!["10.0.0.1:7777".into()]);
         assert_eq!(node.node_id, kp.node_id());
         assert_eq!(node.primary_endpoint(), Some("10.0.0.1:7777"));
+    }
+
+    #[test]
+    fn machine_id_explicit_wins_and_is_stable() {
+        // An explicit override is returned verbatim.
+        assert_eq!(resolve_machine_id(Some("abc-123".into()), None), "abc-123");
+        // With a data dir, the resolved id is stable across calls (OS machine-id
+        // if present, else a persisted uuid) — never empty, never changing.
+        let dir = std::env::temp_dir().join(format!("ocf-mid-{}", uuid::Uuid::new_v4()));
+        let first = resolve_machine_id(None, Some(&dir));
+        let second = resolve_machine_id(None, Some(&dir));
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

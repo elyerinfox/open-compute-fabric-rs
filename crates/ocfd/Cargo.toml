@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 ocf-core.workspace = true
 ocf-api.workspace = true
+ocf-fabric.workspace = true
 
 tokio.workspace = true
 clap.workspace = true

@@ -17,9 +17,17 @@ use ocf_api::{ControllerConfig, FabricController};
 #[derive(Parser)]
 #[command(name = "ocfd", version, about)]
 struct Cli {
-    /// This node's stable identity in the fleet.
-    #[arg(long, env = "OCF_NODE_ID", default_value = "node-local", global = true)]
-    node_id: String,
+    /// Override this node's stable identity. Omit to **auto-derive** it from the
+    /// host (`/etc/machine-id`, else a persisted UUID, else the hostname) — the
+    /// operator doesn't have to name the node.
+    #[arg(long, env = "OCF_NODE_ID", global = true)]
+    node_id: Option<String>,
+    /// A friendly display name for this node. Omit to default to the hostname.
+    #[arg(long, env = "OCF_NODE_NAME", global = true)]
+    node_name: Option<String>,
+    /// Override the host machine id used to derive the node identity.
+    #[arg(long, env = "OCF_MACHINE_ID", global = true)]
+    machine_id: Option<String>,
     /// Directory for durable state; omit to run fully in-memory.
     #[arg(long, env = "OCF_DATA_DIR", global = true)]
     data_dir: Option<PathBuf>,
@@ -60,15 +68,30 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Auto-derive a stable, unique identity from the host (no manual node id
+    // required); an explicit `--node-id` still wins. The friendly name defaults
+    // to the hostname.
+    let node_id = ocf_fabric::resolve_machine_id(
+        cli.node_id.clone().or_else(|| cli.machine_id.clone()),
+        cli.data_dir.as_deref(),
+    );
+    let node_name = cli
+        .node_name
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(ocf_fabric::detect_hostname)
+        .unwrap_or_else(|| node_id.clone());
+
     let config = ControllerConfig {
-        node_id: cli.node_id.clone(),
+        node_id: node_id.clone(),
+        node_name: node_name.clone(),
         data_dir: cli.data_dir.clone(),
         seeds: cli.seeds.clone(),
         fabric_address: cli.fabric_address.clone(),
         ..Default::default()
     };
 
-    tracing::info!(node_id = %config.node_id, "building fabric controller");
+    tracing::info!(identity = %config.node_id, name = %config.node_name, "building fabric controller");
     let controller = Arc::new(FabricController::bootstrap(config).await?);
 
     match cli.command {

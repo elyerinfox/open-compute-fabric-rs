@@ -892,6 +892,7 @@ Shown from `node-2` (private): the relay `node-1` is pinned with keepalive 25
 ```json
 {
   "node": "node-2",
+  "name": "rack3-srv7",
   "reachability": "private",
   "public_key": "nOjMzMr58+b6g8QE9Qj82w4IaoEmW5QAGI8CiRUHbF0=",
   "planes": [

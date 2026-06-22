@@ -6,8 +6,13 @@ use std::path::PathBuf;
 /// who to contact to join the fleet.
 #[derive(Clone, Debug)]
 pub struct ControllerConfig {
-    /// This node's stable identity in the fleet.
+    /// This node's stable, unique identity in the fleet — derived from the host
+    /// machine id (not a hand-typed name), so two nodes never collide. Drives the
+    /// fabric keypair, Raft id, and membership id.
     pub node_id: String,
+    /// A friendly, human-readable display name for this node (defaults to the
+    /// hostname). Purely cosmetic — changing it doesn't change the identity.
+    pub node_name: String,
     /// Directory for durable state. `None` runs fully in-memory (state is lost
     /// on restart); `Some(dir)` persists to `dir/state.redb` and reloads on boot.
     pub data_dir: Option<PathBuf>,
@@ -35,6 +40,7 @@ impl Default for ControllerConfig {
     fn default() -> Self {
         ControllerConfig {
             node_id: "node-local".to_string(),
+            node_name: "node-local".to_string(),
             data_dir: None,
             seeds: Vec::new(),
             fabric_address: None,

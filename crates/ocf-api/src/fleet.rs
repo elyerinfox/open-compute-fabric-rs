@@ -635,7 +635,10 @@ pub struct WireguardPlaneView {
 /// can't run.
 #[derive(Serialize)]
 pub struct WireguardView {
+    /// This node's stable identity (derived from the host machine id).
     pub node: String,
+    /// This node's friendly display name (the hostname by default).
+    pub name: String,
     pub reachability: String,
     pub public_key: String,
     pub planes: Vec<WireguardPlaneView>,
@@ -716,6 +719,7 @@ impl FabricController {
 
         WireguardView {
             node: self.node_id.clone(),
+            name: self.node_name.clone(),
             reachability: reachability_str(self_reach).into(),
             public_key: my_kp.public.to_wireguard_key(),
             planes,

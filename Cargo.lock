@@ -1419,6 +1419,7 @@ dependencies = [
  "clap",
  "ocf-api",
  "ocf-core",
+ "ocf-fabric",
  "tokio",
  "tracing",
  "tracing-subscriber",
