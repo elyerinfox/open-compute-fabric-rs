@@ -533,15 +533,38 @@ keepalive:
 |-----------|------|----------|-----------|-----|
 | any | `public` / `relay` | **pinned** (`addr:port`) | 25 iff *we* are `private` | dialable; if we're NAT'd our keepalive holds the mapping open |
 | `public` / `relay` | `private` | **unset (roam-learned)** | 0 | the private peer reverse-connects; WireGuard learns its endpoint from the first authenticated packet |
-| `private` | `private` | — (routed via relay) | — | neither is directly reachable, so the peer's overlay `/32` is bounced through a `relay` node's `allowed-ips` (the relay forwards; needs `ip_forward`, which the health system checks) |
+| `private` | `private` | — (routed via relay) | — | neither is directly reachable, so the peer's overlay `/32` is bounced through a relay (see below) |
 
 So a `private` node pins + keepalives toward every `public`/`relay` peer (it dials
 out, NAT mappings stay open), while those peers leave the `private` node's endpoint
 unset and roam-learn it. The result is **bidirectional connectivity with no public
 address on the NAT'd side** — verifiable at `GET /api/v1/fabric/wireguard`, which
 shows each peer's `reachability`, `endpoint` (`null` = roam-learned), and
-`keepalive`. (Two `private` nodes with no relay between them remain unreachable —
-the held-tunnel / DERP-style relay is the documented next step.)
+`keepalive`.
+
+### Relay bounce — so *all* nodes can reach each other
+
+Two `private` nodes can't reach each other directly, so traffic is **bounced
+through a relay**, completing the any-to-any mesh:
+
+- The persistent **held tunnel** is the keepalive: each private node keeps an
+  outbound WireGuard tunnel to the relay open, so the relay can always reach it.
+- A private node routes another private peer's overlay `/32` through the relay
+  (the `/32` goes into the relay peer's `allowed-ips`); the relay has both private
+  nodes as roam-learned peers, so it re-encrypts and forwards.
+- A **relay node enables IP forwarding** on boot (`enable_ip_forwarding`) — without
+  it the kernel would drop the bounced packet. (The health system also surfaces
+  `ip_forward` state.)
+- The relay is chosen by `pick_relay`: the **lowest-RTT alive** relay (using the
+  measured [latency map](ocf-fabric.md#topology-intelligence-latency-reachability--routing)).
+  WireGuard is re-programmed on any membership change, so a private node **fails
+  over** to another live relay if its relay dies, and picks up a newly-joined one.
+
+The invariant: **given at least one reachable relay, every pair of nodes can
+talk** — public↔public direct, private↔public/relay by reverse-connect, and
+private↔private bounced through the relay. (A node that is `private` with *no*
+relay available logs a warning; designating ≥ 1 `public`/`relay` node is the
+requirement. Multi-hop relay chains for partitioned relays are a future refinement.)
 
 When a workload attaches to a subnet (`POST /api/v1/workloads/:id/network`), the
 controller resolves the container's host PID

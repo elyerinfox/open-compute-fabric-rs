@@ -319,6 +319,7 @@ impl FabricController {
             for node in self.membership.alive() {
                 self.membership.heartbeat(&node.node_id);
             }
+            let mut topology_changed = false;
             for event in self.membership.tick(Utc::now()) {
                 match event {
                     MembershipEvent::Suspected(id) => {
@@ -327,9 +328,20 @@ impl FabricController {
                     MembershipEvent::Died(id) => {
                         tracing::error!(node = %id, "peer declared dead");
                         self.on_node_dead(&id).await;
+                        topology_changed = true;
                     }
-                    _ => {}
+                    MembershipEvent::Recovered(_)
+                    | MembershipEvent::Joined(_)
+                    | MembershipEvent::Left(_) => {
+                        topology_changed = true;
+                    }
                 }
+            }
+            // Membership changed — re-program WireGuard so a private node fails
+            // over to another live relay (and a recovered/joined relay is used).
+            // ensure_interface / set_peer are idempotent, so this safely converges.
+            if topology_changed {
+                self.program_wireguard().await;
             }
         }
     }

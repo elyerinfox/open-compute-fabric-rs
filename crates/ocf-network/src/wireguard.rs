@@ -260,6 +260,20 @@ pub async fn attach_workload_veth(
     Ok(())
 }
 
+/// Enable IPv4 (and best-effort IPv6) forwarding so this host can act as a
+/// WireGuard **relay** — bouncing decrypted traffic between two peers that can't
+/// reach each other directly (e.g. two NAT'd nodes). Without this the kernel
+/// silently drops the forwarded packet, so a relay node must call it. Idempotent;
+/// writes the `/proc/sys` knobs directly (no `sysctl` binary needed).
+pub async fn enable_ip_forwarding() -> Result<()> {
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
+        .map_err(|e| Error::provider("sysctl", format!("enable net.ipv4.ip_forward: {e}")))?;
+    // IPv6 is best-effort — absent on IPv4-only hosts.
+    let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1");
+    tracing::info!("ip forwarding enabled (relay)");
+    Ok(())
+}
+
 /// The bridge interface name for a subnet — matches the netns backend's naming
 /// (`br-<first 8 chars of subnet id>`), so the container attach lands on the same
 /// bridge the subnet was realized on.
