@@ -169,12 +169,15 @@ impl WireguardUnderlay {
         Ok(mode)
     }
 
-    /// Add (or update) a peer: its WireGuard public key, real underlay endpoint
-    /// (`host:port`), the WireGuard `allowed-ips` it owns, and a keepalive.
+    /// Add (or update) a peer: its WireGuard public key, an **optional** underlay
+    /// endpoint (`host:port`; `None` leaves it for WireGuard to *roam-learn* from
+    /// the peer's first authenticated packet — how a NAT'd peer that
+    /// reverse-connects is reached), the comma-separated `allowed-ips` routed to
+    /// it, and a keepalive (`0` = off; non-zero holds a NAT mapping open).
     pub async fn set_peer(
         &self,
         public_key_b64: &str,
-        endpoint: &str,
+        endpoint: Option<&str>,
         allowed_ips: &str,
         keepalive_secs: u16,
     ) -> Result<()> {
@@ -187,7 +190,12 @@ impl WireguardUnderlay {
         );
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         run("wg", &argv).await?;
-        tracing::info!(iface = %self.iface, %endpoint, "WireGuard peer programmed");
+        tracing::info!(
+            iface = %self.iface,
+            endpoint = endpoint.unwrap_or("(roam-learned)"),
+            keepalive = keepalive_secs,
+            "WireGuard peer programmed"
+        );
         Ok(())
     }
 
@@ -197,27 +205,31 @@ impl WireguardUnderlay {
     }
 }
 
-/// Build the `wg set <iface> peer <key> endpoint <ep> allowed-ips <ips>
-/// persistent-keepalive <n>` argv. Pure and unit-tested.
+/// Build the `wg set <iface> peer <key> [endpoint <ep>] allowed-ips <ips>
+/// persistent-keepalive <n>` argv. The `endpoint` is omitted when `None` (the
+/// peer is reached by roaming). Pure and unit-tested.
 fn wg_set_peer_args(
     iface: &str,
     public_key_b64: &str,
-    endpoint: &str,
+    endpoint: Option<&str>,
     allowed_ips: &str,
     keepalive_secs: u16,
 ) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "set".into(),
         iface.into(),
         "peer".into(),
         public_key_b64.into(),
-        "endpoint".into(),
-        endpoint.into(),
-        "allowed-ips".into(),
-        allowed_ips.into(),
-        "persistent-keepalive".into(),
-        keepalive_secs.to_string(),
-    ]
+    ];
+    if let Some(ep) = endpoint {
+        args.push("endpoint".into());
+        args.push(ep.into());
+    }
+    args.push("allowed-ips".into());
+    args.push(allowed_ips.into());
+    args.push("persistent-keepalive".into());
+    args.push(keepalive_secs.to_string());
+    args
 }
 
 /// Splice a workload into a subnet: create a veth pair, move one end into the
@@ -289,22 +301,35 @@ mod tests {
     }
 
     #[test]
-    fn wg_set_peer_args_are_well_formed() {
+    fn wg_set_peer_args_with_endpoint() {
         let args = wg_set_peer_args(
             "wg-ocf",
             "abcDEF0123456789abcDEF0123456789abcDEF01234=",
-            "10.0.0.2:51820",
+            Some("10.0.0.2:51820"),
             "10.255.0.2/32",
             25,
         );
-        assert_eq!(args[0], "set");
-        assert_eq!(args[1], "wg-ocf");
-        assert_eq!(args[2], "peer");
-        // endpoint + allowed-ips + keepalive present and ordered.
+        assert_eq!(&args[0..3], &["set", "wg-ocf", "peer"]);
         let joined = args.join(" ");
         assert!(joined.contains("endpoint 10.0.0.2:51820"));
         assert!(joined.contains("allowed-ips 10.255.0.2/32"));
         assert!(joined.contains("persistent-keepalive 25"));
+    }
+
+    #[test]
+    fn wg_set_peer_args_roam_learned_omits_endpoint() {
+        // A reverse-connecting (NAT'd) peer is programmed with no endpoint.
+        let args = wg_set_peer_args(
+            "wg-ocf",
+            "abcDEF0123456789abcDEF0123456789abcDEF01234=",
+            None,
+            "10.255.0.2/32",
+            0,
+        );
+        let joined = args.join(" ");
+        assert!(!joined.contains("endpoint"), "endpoint must be omitted for roaming");
+        assert!(joined.contains("allowed-ips 10.255.0.2/32"));
+        assert!(joined.contains("persistent-keepalive 0"));
     }
 
     #[test]

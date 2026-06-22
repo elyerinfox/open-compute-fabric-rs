@@ -876,22 +876,31 @@ VNIs / ACLs over `wg-data` (see
 
 **Response**
 
+Each peer also reports its `reachability` and the **reachability-aware** WireGuard
+config: `endpoint` is `null` when it is roam-learned (a NAT'd peer that
+reverse-connects), and `keepalive` is non-zero when *this* node holds a mapping
+open (see [ocf-network → Reachability-aware peering](../subsystems/ocf-network.md#reachability-aware-peering--reverse-connect-for-natd-nodes)).
+
 ```json
 {
-  "node": "node-1",
+  "node": "node-3",
+  "reachability": "public",
   "public_key": "0SqA+ka2sZVRFmhvkj0Zb9sPAg3k5G6YKkdKeV1UAjE=",
   "planes": [
     {
       "iface": "wg-mgmt", "purpose": "control",
-      "node_ip": "10.255.0.1", "port": 51820,
+      "node_ip": "10.255.0.3", "port": 51820,
       "peers": [
-        { "name": "node-2", "wg_ip": "10.255.0.2",
-          "endpoint": "10.0.0.2:51820",
-          "public_key": "nOjMzMr58+b6g8QE9Qj82w4IaoEmW5QAGI8CiRUHbF0=" }
+        { "name": "node-1", "wg_ip": "10.255.0.1", "reachability": "relay",
+          "endpoint": "10.0.0.1:51820", "keepalive": 0,
+          "public_key": "nOjMzMr58+b6g8QE9Qj82w4IaoEmW5QAGI8CiRUHbF0=" },
+        { "name": "node-2", "wg_ip": "10.255.0.2", "reachability": "private",
+          "endpoint": null, "keepalive": 0,
+          "public_key": "ZsHkQzWYN26TVHPLM/VM3Dgo+AUPwI5l6fbi68VXNHg=" }
       ]
     },
-    { "iface": "wg-data", "purpose": "workload", "node_ip": "10.254.0.1", "port": 51821, "peers": [] },
-    { "iface": "wg-lb", "purpose": "load-balancer", "node_ip": "10.253.0.1", "port": 51822, "peers": [] }
+    { "iface": "wg-data", "purpose": "workload", "node_ip": "10.254.0.3", "port": 51821, "peers": [] },
+    { "iface": "wg-lb", "purpose": "load-balancer", "node_ip": "10.253.0.3", "port": 51822, "peers": [] }
   ]
 }
 ```

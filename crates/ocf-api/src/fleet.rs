@@ -457,7 +457,13 @@ pub struct MemberView {
 pub struct WireguardPeerView {
     pub name: String,
     pub wg_ip: String,
+    pub reachability: String,
+    /// The pinned WireGuard endpoint, or `null` when it is **roam-learned**
+    /// (a NAT'd peer that reverse-connects).
     pub endpoint: Option<String>,
+    /// `persistent-keepalive` seconds toward this peer (`0` = off; non-zero holds
+    /// *our* NAT mapping open when we reverse-connect).
+    pub keepalive: u16,
     pub public_key: String,
 }
 
@@ -477,6 +483,7 @@ pub struct WireguardPlaneView {
 #[derive(Serialize)]
 pub struct WireguardView {
     pub node: String,
+    pub reachability: String,
     pub public_key: String,
     pub planes: Vec<WireguardPlaneView>,
 }
@@ -484,9 +491,27 @@ pub struct WireguardView {
 impl FabricController {
     /// The computed WireGuard planes (this node + peers per plane). Control rides
     /// `wg-mgmt`, the VXLAN workload overlay `wg-data`, the LB `wg-lb` — three
-    /// isolated encrypted underlays.
+    /// isolated encrypted underlays. Each peer shows the **reachability-aware**
+    /// config: a pinned endpoint for dialable peers, `null` (roam-learned) for a
+    /// NAT'd peer that reverse-connects, and keepalive when we hold a mapping open.
     pub async fn wireguard_status(&self) -> WireguardView {
+        use crate::controller::{reachability_from_machine, wg_direct_endpoint_keepalive};
+
         let plan = self.machine_plan().await;
+        let machines = self
+            .topology
+            .store()
+            .all_machines()
+            .await
+            .unwrap_or_default();
+        let reach_of = |name: &str| {
+            machines
+                .iter()
+                .find(|m| m.metadata.name == name)
+                .map(reachability_from_machine)
+                .unwrap_or(ocf_fabric::Reachability::Public)
+        };
+        let self_reach = reach_of(&self.node_id);
         let my_kp = ocf_fabric::KeyPair::from_seed_name(&self.node_id);
         let self_idx = plan
             .iter()
@@ -506,13 +531,24 @@ impl FabricController {
             let peers = plan
                 .iter()
                 .filter(|(_, name, _, _)| name != &self.node_id)
-                .map(|(_, name, index, addr)| WireguardPeerView {
-                    name: name.clone(),
-                    wg_ip: plane.ip(*index),
-                    endpoint: addr.as_ref().map(|a| format!("{a}:{}", plane.port)),
-                    public_key: ocf_fabric::KeyPair::from_seed_name(name)
-                        .public
-                        .to_wireguard_key(),
+                .map(|(_, name, index, addr)| {
+                    let peer_reach = reach_of(name);
+                    let (endpoint, keepalive) = wg_direct_endpoint_keepalive(
+                        self_reach,
+                        peer_reach,
+                        addr.as_deref(),
+                        plane.port,
+                    );
+                    WireguardPeerView {
+                        name: name.clone(),
+                        wg_ip: plane.ip(*index),
+                        reachability: reachability_str(peer_reach).into(),
+                        endpoint,
+                        keepalive,
+                        public_key: ocf_fabric::KeyPair::from_seed_name(name)
+                            .public
+                            .to_wireguard_key(),
+                    }
                 })
                 .collect();
             WireguardPlaneView {
@@ -527,6 +563,7 @@ impl FabricController {
 
         WireguardView {
             node: self.node_id.clone(),
+            reachability: reachability_str(self_reach).into(),
             public_key: my_kp.public.to_wireguard_key(),
             planes,
         }

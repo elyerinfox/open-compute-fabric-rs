@@ -519,8 +519,29 @@ module at all — is the documented next step, reusing the same X25519 identity.
 A node's **WireGuard identity is its fabric identity**: the `ocf-fabric` X25519
 keypair *is* a Curve25519 WireGuard key (`PublicKey::to_wireguard_key()` /
 `SecretKey::to_wireguard_key()` base64-encode it), used on every plane. The peer
-set is the fabric membership; a peer's WireGuard `endpoint` is its real underlay
-address, while its `allowed-ips` is its overlay address *on that plane only*.
+set is the fabric membership; a peer's `allowed-ips` is its overlay address *on
+that plane only*.
+
+### Reachability-aware peering — reverse-connect for NAT'd nodes
+
+Peer programming is shaped by each node's [`Reachability`](ocf-fabric.md)
+(`public` / `private` / `relay`), so a node **without a public IPv4** joins the
+fabric by *reverse-connecting* — `plan_wg_peers` decides each peer's endpoint and
+keepalive:
+
+| This node | Peer | Endpoint | Keepalive | Why |
+|-----------|------|----------|-----------|-----|
+| any | `public` / `relay` | **pinned** (`addr:port`) | 25 iff *we* are `private` | dialable; if we're NAT'd our keepalive holds the mapping open |
+| `public` / `relay` | `private` | **unset (roam-learned)** | 0 | the private peer reverse-connects; WireGuard learns its endpoint from the first authenticated packet |
+| `private` | `private` | — (routed via relay) | — | neither is directly reachable, so the peer's overlay `/32` is bounced through a `relay` node's `allowed-ips` (the relay forwards; needs `ip_forward`, which the health system checks) |
+
+So a `private` node pins + keepalives toward every `public`/`relay` peer (it dials
+out, NAT mappings stay open), while those peers leave the `private` node's endpoint
+unset and roam-learn it. The result is **bidirectional connectivity with no public
+address on the NAT'd side** — verifiable at `GET /api/v1/fabric/wireguard`, which
+shows each peer's `reachability`, `endpoint` (`null` = roam-learned), and
+`keepalive`. (Two `private` nodes with no relay between them remain unreachable —
+the held-tunnel / DERP-style relay is the documented next step.)
 
 When a workload attaches to a subnet (`POST /api/v1/workloads/:id/network`), the
 controller resolves the container's host PID
