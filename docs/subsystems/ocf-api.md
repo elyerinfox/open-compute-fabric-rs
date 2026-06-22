@@ -345,7 +345,14 @@ pub fn build_app(controller: Arc<FabricController>, static_dir: Option<PathBuf>)
 pub async fn serve(addr: SocketAddr, controller: Arc<FabricController>, static_dir: Option<PathBuf>) -> Result<()>;
 ```
 
-- **`build_app`** starts from `routes::api_router(controller)`; if `static_dir`
+- **`build_app`** starts from `routes::api_router(controller)`, then layers the
+  **`authz` middleware** (`authz.rs`) that gates the API behind RBAC: it maps each
+  request to its required [`Permission`](ocf-authz.md), authenticates the caller
+  from the `Authorization` header (Basic/Bearer) via the
+  [authenticators](ocf-auth.md), and `authorize`s the principal — `401`
+  unauthenticated, `403` forbidden. Mutations and `/access`/`/admin` are gated;
+  ordinary reads pass through. See [REST API → Authentication & authorization](../reference/rest-api.md#authentication--authorization).
+  If `static_dir`
   is `Some` and is a directory, it appends a `ServeDir` with a `ServeFile`
   fallback to `index.html` (SPA routing); a missing static dir logs a warning and
   serves API-only. It then layers `TraceLayer::new_for_http()` (request tracing)

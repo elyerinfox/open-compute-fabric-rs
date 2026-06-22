@@ -19,6 +19,35 @@ handler is a thin adapter that borrows one subsystem off the
 > take **no request body** — the action is fully described by the method, path,
 > and path parameter.
 
+## Authentication & authorization
+
+Key functionality is gated behind the fabric's RBAC ([`ocf-authz`](../subsystems/ocf-authz.md)).
+A middleware authenticates the caller from the `Authorization` header — HTTP
+**Basic** (`Authorization: Basic base64(user:pass)`) or a **Bearer** token,
+verified by the registered [authenticators](../subsystems/ocf-auth.md) — and asks
+the RBAC engine whether that principal may perform the action. The default
+credentials are `admin` / `admin`.
+
+| Request | Required permission |
+|---------|--------------------|
+| `GET /health` and ordinary reads | _(open — no credentials)_ |
+| `GET`/`POST`/`DELETE` `/access/*`, `/admin/*` | `sys.read` / `sys.modify` (admin) |
+| writes under `/workloads/*` | `workload.manage` |
+| writes under `/networks/*` | `vpc.manage` |
+| writes under `/loadbalancers/*` | `lb.manage` |
+| all other writes (platform updates, health fixes, fabric machine fail/heartbeat, …) | `sys.modify` |
+
+Missing or invalid credentials → **`401 Unauthorized`**; an authenticated
+principal without the permission → **`403 Forbidden`**. Ordinary reads stay open
+so the dashboard works without credentials; the privileged identity/admin routes
+are gated for read *and* write.
+
+```sh
+# A mutation requires credentials:
+curl -u admin:admin -X POST http://localhost:8080/api/v1/platform/updates/apply \
+  -H 'content-type: application/json' -d '{"security_only":true}'
+```
+
 ## Endpoint summary
 
 | Method | Path | Area | Description |

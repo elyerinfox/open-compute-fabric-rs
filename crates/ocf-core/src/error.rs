@@ -63,6 +63,9 @@ impl Error {
     pub fn forbidden(what: impl Into<String>) -> Self {
         Self::Forbidden(what.into())
     }
+    pub fn unauthenticated(what: impl Into<String>) -> Self {
+        Self::Unauthenticated(what.into())
+    }
     pub fn internal(what: impl Into<String>) -> Self {
         Self::Internal(what.into())
     }

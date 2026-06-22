@@ -7,6 +7,7 @@
 //! frontend as static files. The `ocfd` binary constructs one controller and
 //! hands it to [`serve`].
 
+pub mod authz;
 pub mod config;
 pub mod controller;
 pub mod dto;
@@ -34,7 +35,11 @@ use tower_http::trace::TraceLayer;
 /// and — when `static_dir` is provided and exists — the built frontend with an
 /// SPA fallback to `index.html`.
 pub fn build_app(controller: Arc<FabricController>, static_dir: Option<PathBuf>) -> Router {
-    let mut app = routes::api_router(controller);
+    // Gate the API behind RBAC: mutations and identity/admin routes require an
+    // authenticated, authorized principal (open reads pass through).
+    let mut app = routes::api_router(controller.clone()).layer(
+        axum::middleware::from_fn_with_state(controller, authz::authz_middleware),
+    );
 
     if let Some(dir) = static_dir {
         if dir.is_dir() {
