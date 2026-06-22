@@ -834,18 +834,19 @@ last **measured** round-trip latency to the peer (`null` until probed);
 
 ### `GET /api/v1/fabric/routes`
 
-The planned route from this node to every peer, weighed by measured RTT.
-`route` is `"direct"` (peer dialable), `"relayed"` (peer is `private`, reached
-through `via`), or `"unreachable"`; `cost_ms` is the estimated path cost.
-
-**Response**
+The route from this node to every peer, computed over the fabric
+[`RouteGraph`](../subsystems/ocf-fabric.md#topology-intelligence-latency-reachability--routing)
+(shortest path weighed by gossiped RTTs). `route` is `"direct"`, `"relayed"`
+(reached through the next-hop relay `via`, with the full `hops` path), or
+`"unreachable"`. Shown here from a `private` node toward another `private` node,
+which bounces through the relay:
 
 ```json
 [
   { "target": "node-1", "machine_id": "node-1", "reachability": "relay",
-    "route": "direct", "via": null, "cost_ms": 0.42 },
-  { "target": "node-2", "machine_id": "node-2", "reachability": "private",
-    "route": "relayed", "via": "node-1", "cost_ms": 50.42 }
+    "route": "direct", "via": null, "hops": [] },
+  { "target": "node-3", "machine_id": "node-3", "reachability": "private",
+    "route": "relayed", "via": "node-1", "hops": ["node-1", "node-3"] }
 ]
 ```
 
@@ -881,26 +882,30 @@ config: `endpoint` is `null` when it is roam-learned (a NAT'd peer that
 reverse-connects), and `keepalive` is non-zero when *this* node holds a mapping
 open (see [ocf-network → Reachability-aware peering](../subsystems/ocf-network.md#reachability-aware-peering--reverse-connect-for-natd-nodes)).
 
+Shown from `node-2` (private): the relay `node-1` is pinned with keepalive 25
+(node-2 dials out and holds its NAT mapping), while the other private node
+`node-3` has `endpoint: null` (it reverse-connects / is reached via the relay).
+
 ```json
 {
-  "node": "node-3",
-  "reachability": "public",
-  "public_key": "0SqA+ka2sZVRFmhvkj0Zb9sPAg3k5G6YKkdKeV1UAjE=",
+  "node": "node-2",
+  "reachability": "private",
+  "public_key": "nOjMzMr58+b6g8QE9Qj82w4IaoEmW5QAGI8CiRUHbF0=",
   "planes": [
     {
       "iface": "wg-mgmt", "purpose": "control",
-      "node_ip": "10.255.0.3", "port": 51820,
+      "node_ip": "10.255.0.2", "port": 51820,
       "peers": [
         { "name": "node-1", "wg_ip": "10.255.0.1", "reachability": "relay",
-          "endpoint": "10.0.0.1:51820", "keepalive": 0,
-          "public_key": "nOjMzMr58+b6g8QE9Qj82w4IaoEmW5QAGI8CiRUHbF0=" },
-        { "name": "node-2", "wg_ip": "10.255.0.2", "reachability": "private",
+          "endpoint": "10.0.0.1:51820", "keepalive": 25,
+          "public_key": "0SqA+ka2sZVRFmhvkj0Zb9sPAg3k5G6YKkdKeV1UAjE=" },
+        { "name": "node-3", "wg_ip": "10.255.0.3", "reachability": "private",
           "endpoint": null, "keepalive": 0,
           "public_key": "ZsHkQzWYN26TVHPLM/VM3Dgo+AUPwI5l6fbi68VXNHg=" }
       ]
     },
-    { "iface": "wg-data", "purpose": "workload", "node_ip": "10.254.0.3", "port": 51821, "peers": [] },
-    { "iface": "wg-lb", "purpose": "load-balancer", "node_ip": "10.253.0.3", "port": 51822, "peers": [] }
+    { "iface": "wg-data", "purpose": "workload", "node_ip": "10.254.0.2", "port": 51821, "peers": [] },
+    { "iface": "wg-lb", "purpose": "load-balancer", "node_ip": "10.253.0.2", "port": 51822, "peers": [] }
   ]
 }
 ```

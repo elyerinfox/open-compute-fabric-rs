@@ -22,7 +22,7 @@ use ocf_auth::{Authenticator, LinuxUserSync, LocalAuthenticator};
 use ocf_authz::{Group, RbacEngine, RoleBinding, Subject, User, ADMINISTRATOR_ROLE};
 use ocf_disk::{DiskHealth, DiskService, LedControl, PhysicalDisk, SysfsDiskManager};
 use ocf_fabric::{
-    FabricMesh, FabricNode, FabricTransport, KeyPair, Membership, NodeId, Reachability,
+    FabricMesh, FabricNode, FabricTransport, KeyPair, Membership, NodeId, Reachability, RouteGraph,
 };
 use ocf_health::{HealthCheck, HealthService, PackageCheck};
 use ocf_platform::PlatformService;
@@ -71,6 +71,10 @@ pub(crate) struct WgPeer {
     pub index: usize,
     pub addr: Option<String>,
     pub public_key: String,
+    /// When this peer isn't directly reachable (both private), the wg public key
+    /// of the **next-hop relay** the [`RouteGraph`](ocf_fabric::RouteGraph) chose
+    /// to reach it through. `None` when it is direct (or has no path).
+    pub via: Option<String>,
 }
 
 /// A WireGuard peer entry to program: its key, an optional pinned `endpoint`
@@ -103,34 +107,20 @@ pub(crate) fn wg_direct_endpoint_keepalive(
     }
 }
 
-/// Choose the relay to bounce traffic through when two nodes can't peer directly:
-/// the **alive** relay with the lowest measured RTT (unmeasured relays rank last).
-/// `relays` is `(wg_public_key, measured_rtt_ms, is_alive)`. `None` when no alive
-/// relay exists — the case where two private-only nodes cannot reach each other.
-pub(crate) fn pick_relay(relays: &[(String, Option<f64>, bool)]) -> Option<String> {
-    relays
-        .iter()
-        .filter(|(_, _, alive)| *alive)
-        .min_by(|a, b| {
-            a.1.unwrap_or(f64::INFINITY)
-                .partial_cmp(&b.1.unwrap_or(f64::INFINITY))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(key, _, _)| key.clone())
-}
-
-/// Reachability-aware WireGuard peer plan for one plane.
+/// Reachability- and graph-aware WireGuard peer plan for one plane.
 ///
-/// * A directly-reachable peer is peered with [`wg_direct_endpoint_keepalive`].
-/// * Two **private** nodes can't reach each other directly, so the peer's overlay
-///   `/32` is routed through `relay_key` (added to the relay peer's `allowed-ips`);
-///   the relay forwards it (the relay node enables `ip_forward`). With no relay
-///   (`relay_key == None`) such a peer is omitted — unreachable.
+/// * A directly-reachable peer (not both-private) is peered with
+///   [`wg_direct_endpoint_keepalive`].
+/// * Two **private** nodes can't peer directly, so the peer's overlay `/32` is
+///   routed through its `via` next-hop relay (chosen per-destination by the
+///   [`RouteGraph`](ocf_fabric::RouteGraph)); the `/32` is added to that relay's
+///   `allowed-ips` and the relay forwards it (relays enable `ip_forward`). With no
+///   `via` (no path) the peer is omitted — unreachable. Because `via` is
+///   per-destination, **different peers can route through different relays**.
 pub(crate) fn plan_wg_peers(
     plane: WgPlane,
     self_reach: Reachability,
     peers: &[WgPeer],
-    relay_key: Option<&str>,
 ) -> Vec<WgPeerSpec> {
     fn upsert<'a>(specs: &'a mut Vec<WgPeerSpec>, key: &str) -> &'a mut WgPeerSpec {
         if let Some(i) = specs.iter().position(|s| s.public_key == key) {
@@ -162,12 +152,12 @@ pub(crate) fn plan_wg_peers(
             spec.endpoint = endpoint;
             spec.keepalive = keepalive;
             add_cidr(spec, cidr);
-        } else if let Some(rk) = relay_key {
-            // Both private: bounce this peer's overlay /32 through the relay.
-            let spec = upsert(&mut specs, rk);
+        } else if let Some(via) = &p.via {
+            // Both private: bounce this peer's overlay /32 through its next-hop relay.
+            let spec = upsert(&mut specs, via);
             add_cidr(spec, cidr);
         }
-        // else: both private and no relay → unreachable, omitted.
+        // else: both private and no path → unreachable, omitted.
     }
     specs
 }
@@ -205,6 +195,10 @@ pub struct FabricController {
     /// query `docker`/`virsh` for live state), so the rich network binding lives
     /// here, persisted, keyed by workload id.
     pub(crate) attachments: parking_lot::RwLock<std::collections::HashMap<Id, NetworkAttachment>>,
+    /// Latency maps fetched from peers (`peer node id -> (node id -> rtt ms)`), so
+    /// this node can assemble a fleet-wide [`RouteGraph`] for graph-aware routing.
+    pub(crate) peer_latency:
+        parking_lot::RwLock<std::collections::HashMap<NodeId, std::collections::BTreeMap<String, f64>>>,
 }
 
 impl FabricController {
@@ -324,6 +318,7 @@ impl FabricController {
             platform,
             health,
             attachments: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            peer_latency: parking_lot::RwLock::new(std::collections::HashMap::new()),
         };
 
         // --- restore-or-seed ------------------------------------------------
@@ -526,6 +521,39 @@ impl FabricController {
             .map(|(_, _, i, _)| *i)
     }
 
+    /// Assemble the fleet [`RouteGraph`]: every machine as a node (with its
+    /// reachability), this node's measured RTTs, and the latency maps peers have
+    /// shared — so shortest-path / next-hop relay selection sees the whole fabric.
+    pub(crate) async fn route_graph(&self) -> RouteGraph {
+        let machines = self
+            .topology
+            .store()
+            .all_machines()
+            .await
+            .unwrap_or_default();
+        let mut graph = RouteGraph::new();
+        for m in &machines {
+            graph.add_node(
+                KeyPair::from_seed_name(&m.metadata.name).node_id(),
+                reachability_from_machine(m),
+            );
+        }
+        // This node's own measurements (self -> peer).
+        let me = KeyPair::from_seed_name(&self.node_id).node_id();
+        for member in self.membership.members() {
+            if let Some(rtt) = member.rtt_ms {
+                graph.observe_rtt(me.clone(), member.node.node_id.clone(), rtt);
+            }
+        }
+        // Cross-node edges peers have shared (peer -> other).
+        for (peer, map) in self.peer_latency.read().iter() {
+            for (other, rtt) in map {
+                graph.observe_rtt(peer.clone(), NodeId::new(other), *rtt);
+            }
+        }
+        graph
+    }
+
     /// Bring up one WireGuard plane on this node and program peers on it,
     /// **reachability-aware** (see [`plan_wg_peers`]): a peer's `allowed-ips` is
     /// its overlay address on this plane only (planes stay isolated), its
@@ -538,7 +566,7 @@ impl FabricController {
         plan: &[(Id, String, usize, Option<String>)],
         self_reach: Reachability,
         machines: &[Machine],
-        relay_key: Option<&str>,
+        via_map: &std::collections::HashMap<String, String>,
     ) {
         let wg = WireguardUnderlay::new(plane.iface, plane.port);
         let my_kp = KeyPair::from_seed_name(&self.node_id);
@@ -557,19 +585,23 @@ impl FabricController {
         let peers: Vec<WgPeer> = plan
             .iter()
             .filter(|(_, name, _, _)| name != &self.node_id)
-            .map(|(_, name, index, addr)| WgPeer {
-                reach: machines
-                    .iter()
-                    .find(|m| &m.metadata.name == name)
-                    .map(reachability_from_machine)
-                    .unwrap_or(Reachability::Public),
-                public_key: KeyPair::from_seed_name(name).public.to_wireguard_key(),
-                index: *index,
-                addr: addr.clone(),
+            .map(|(_, name, index, addr)| {
+                let public_key = KeyPair::from_seed_name(name).public.to_wireguard_key();
+                WgPeer {
+                    reach: machines
+                        .iter()
+                        .find(|m| &m.metadata.name == name)
+                        .map(reachability_from_machine)
+                        .unwrap_or(Reachability::Public),
+                    via: via_map.get(&public_key).cloned(),
+                    public_key,
+                    index: *index,
+                    addr: addr.clone(),
+                }
             })
             .collect();
 
-        for spec in plan_wg_peers(plane, self_reach, &peers, relay_key) {
+        for spec in plan_wg_peers(plane, self_reach, &peers) {
             let allowed = spec.allowed_ips.join(",");
             if allowed.is_empty() {
                 continue;
@@ -612,44 +644,54 @@ impl FabricController {
             }
         }
 
-        // Choose the relay to bounce private↔private traffic through: the alive
-        // relay with the lowest measured RTT. Plane-independent (the wg key is the
-        // node's identity, the same on every plane).
-        let members = self.membership.members();
-        let relays: Vec<(String, Option<f64>, bool)> = machines
-            .iter()
-            .filter(|m| m.metadata.name != self.node_id)
-            .filter(|m| reachability_from_machine(m) == Reachability::Relay)
-            .map(|m| {
-                let nid = KeyPair::from_seed_name(&m.metadata.name).node_id();
-                let entry = members.iter().find(|x| x.node.node_id == nid);
-                let rtt = entry.and_then(|x| x.rtt_ms);
-                let alive = entry.map(|x| x.liveness.is_available()).unwrap_or(true);
-                (
-                    KeyPair::from_seed_name(&m.metadata.name)
-                        .public
-                        .to_wireguard_key(),
-                    rtt,
-                    alive,
-                )
-            })
-            .collect();
-        let relay_key = pick_relay(&relays);
-
-        if self_reach == Reachability::Private && relay_key.is_none() {
+        // Graph-aware, per-destination next-hop selection: for every peer this
+        // node can't reach directly (both private), the RouteGraph picks the relay
+        // on the shortest `self → relay → dest` path — so different destinations
+        // can use different relays. `via_map`: dest wg key -> next-hop relay wg key.
+        let graph = self.route_graph().await;
+        let me = KeyPair::from_seed_name(&self.node_id).node_id();
+        let key_of = |name: &str| KeyPair::from_seed_name(name).public.to_wireguard_key();
+        let nid_of = |name: &str| KeyPair::from_seed_name(name).node_id();
+        let mut via_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut unreachable = 0usize;
+        for m in machines.iter().filter(|m| m.metadata.name != self.node_id) {
+            let dest = nid_of(&m.metadata.name);
+            match graph.next_relay(&me, &dest) {
+                Some(relay_nid) => {
+                    if let Some(rm) = machines
+                        .iter()
+                        .find(|x| nid_of(&x.metadata.name) == relay_nid)
+                    {
+                        via_map.insert(key_of(&m.metadata.name), key_of(&rm.metadata.name));
+                    }
+                }
+                None => {
+                    // None = direct *or* no path. It's unreachable only when both
+                    // are private and the graph found no path at all.
+                    if self_reach == Reachability::Private
+                        && reachability_from_machine(m) == Reachability::Private
+                        && graph.path(&me, &dest).is_none()
+                    {
+                        unreachable += 1;
+                    }
+                }
+            }
+        }
+        if unreachable > 0 {
             tracing::warn!(
-                "this node is private and no relay is available — it cannot reach private-only peers"
+                count = unreachable,
+                "this node cannot reach some private-only peers — no relay path (designate a relay)"
             );
         }
 
         for plane in [WG_MGMT, WG_DATA, WG_LB] {
-            self.program_plane(plane, &plan, self_reach, &machines, relay_key.as_deref())
+            self.program_plane(plane, &plan, self_reach, &machines, &via_map)
                 .await;
         }
         tracing::info!(
             peers = plan.len().saturating_sub(1),
             reachability = ?self_reach,
-            relay = relay_key.as_deref().unwrap_or("(none)"),
+            relayed = via_map.len(),
             "wireguard planes programmed (mgmt/data/lb)"
         );
     }
@@ -772,12 +814,12 @@ async fn seed_topology(store: &Arc<dyn TopologyStore>) -> Result<Fleet> {
         } else if i == 1 {
             m.metadata.labels.insert("nvme".into(), "true".into());
         }
-        // Reachability demo: node-1 is a relay; node-2 is private (NAT'd) and is
-        // therefore reached through the relay; node-3 is public.
+        // Reachability demo: node-1 is a public relay; node-2 and node-3 are both
+        // private (NAT'd), so they reverse-connect to the relay and reach *each
+        // other* by bouncing through it — the any-to-any mesh.
         let reach = match i {
             1 => "relay",
-            2 => "private",
-            _ => "public",
+            _ => "private",
         };
         m.metadata
             .labels
@@ -940,6 +982,7 @@ mod tests {
             index,
             addr: addr.map(String::from),
             public_key: key.to_string(),
+            via: None,
         }
     }
     fn find<'a>(specs: &'a [WgPeerSpec], key: &str) -> Option<&'a WgPeerSpec> {
@@ -951,7 +994,7 @@ mod tests {
         // We are behind NAT: a public peer is pinned and keepalive holds our
         // mapping open so the public peer can reply (the reverse-connect).
         let peers = vec![peer(Reachability::Public, 1, Some("203.0.113.7"), "pubkey")];
-        let specs = plan_wg_peers(WG_MGMT, Reachability::Private, &peers, None);
+        let specs = plan_wg_peers(WG_MGMT, Reachability::Private, &peers);
         let s = find(&specs, "pubkey").unwrap();
         assert_eq!(s.endpoint.as_deref(), Some("203.0.113.7:51820"));
         assert_eq!(s.keepalive, 25);
@@ -963,7 +1006,7 @@ mod tests {
         // We're reachable: a private peer reverse-connects, so leave its endpoint
         // unset (WireGuard roam-learns it) and add no keepalive.
         let peers = vec![peer(Reachability::Private, 1, Some("10.0.0.9"), "privkey")];
-        let specs = plan_wg_peers(WG_MGMT, Reachability::Public, &peers, None);
+        let specs = plan_wg_peers(WG_MGMT, Reachability::Public, &peers);
         let s = find(&specs, "privkey").unwrap();
         assert_eq!(s.endpoint, None);
         assert_eq!(s.keepalive, 0);
@@ -973,21 +1016,20 @@ mod tests {
     #[test]
     fn public_to_public_pins_without_keepalive() {
         let peers = vec![peer(Reachability::Public, 2, Some("203.0.113.8"), "pk")];
-        let specs = plan_wg_peers(WG_MGMT, Reachability::Public, &peers, None);
+        let specs = plan_wg_peers(WG_MGMT, Reachability::Public, &peers);
         let s = find(&specs, "pk").unwrap();
         assert_eq!(s.endpoint.as_deref(), Some("203.0.113.8:51820"));
         assert_eq!(s.keepalive, 0);
     }
 
     #[test]
-    fn two_private_nodes_route_via_relay() {
-        // We're private; peer B is also private, so its /32 is bounced through
-        // the chosen relay (no direct peer for B).
-        let peers = vec![
-            peer(Reachability::Relay, 1, Some("203.0.113.1"), "relaykey"),
-            peer(Reachability::Private, 2, Some("10.0.0.5"), "bkey"),
-        ];
-        let specs = plan_wg_peers(WG_MGMT, Reachability::Private, &peers, Some("relaykey"));
+    fn two_private_nodes_route_via_their_next_hop_relay() {
+        // We're private; peer B is also private with `via` set to the relay (the
+        // graph's next hop), so B's /32 is bounced through that relay.
+        let relay = peer(Reachability::Relay, 1, Some("203.0.113.1"), "relaykey");
+        let mut b = peer(Reachability::Private, 2, Some("10.0.0.5"), "bkey");
+        b.via = Some("relaykey".to_string());
+        let specs = plan_wg_peers(WG_MGMT, Reachability::Private, &[relay, b]);
         let relay = find(&specs, "relaykey").unwrap();
         assert_eq!(relay.endpoint.as_deref(), Some("203.0.113.1:51820"));
         assert_eq!(relay.keepalive, 25);
@@ -997,35 +1039,24 @@ mod tests {
     }
 
     #[test]
-    fn two_private_nodes_with_no_relay_is_unreachable() {
+    fn private_peer_with_no_via_is_unreachable() {
+        // Both private and no next-hop relay → omitted entirely.
         let peers = vec![peer(Reachability::Private, 2, Some("10.0.0.5"), "bkey")];
-        let specs = plan_wg_peers(WG_MGMT, Reachability::Private, &peers, None);
+        let specs = plan_wg_peers(WG_MGMT, Reachability::Private, &peers);
         assert!(specs.is_empty());
     }
 
     #[test]
-    fn pick_relay_prefers_lowest_rtt_alive() {
-        let relays = vec![
-            ("far".to_string(), Some(40.0), true),
-            ("near".to_string(), Some(2.0), true),
-            ("unmeasured".to_string(), None, true),
-        ];
-        assert_eq!(pick_relay(&relays).as_deref(), Some("near"));
-    }
-
-    #[test]
-    fn pick_relay_skips_dead_relays() {
-        let relays = vec![
-            ("dead-fast".to_string(), Some(1.0), false),
-            ("live-slow".to_string(), Some(30.0), true),
-        ];
-        assert_eq!(pick_relay(&relays).as_deref(), Some("live-slow"));
-    }
-
-    #[test]
-    fn pick_relay_none_when_no_alive_relay() {
-        let relays = vec![("dead".to_string(), Some(1.0), false)];
-        assert_eq!(pick_relay(&relays), None);
-        assert_eq!(pick_relay(&[]), None);
+    fn different_private_peers_can_use_different_relays() {
+        // Per-destination via: B routes via r1, C via r2 — multiple relays in use.
+        let r1 = peer(Reachability::Relay, 1, Some("203.0.113.1"), "r1");
+        let r2 = peer(Reachability::Relay, 2, Some("203.0.113.2"), "r2");
+        let mut b = peer(Reachability::Private, 3, Some("10.0.0.5"), "bkey");
+        b.via = Some("r1".to_string());
+        let mut c = peer(Reachability::Private, 4, Some("10.0.0.6"), "ckey");
+        c.via = Some("r2".to_string());
+        let specs = plan_wg_peers(WG_MGMT, Reachability::Private, &[r1, r2, b, c]);
+        assert!(find(&specs, "r1").unwrap().allowed_ips.contains(&"10.255.0.4/32".to_string())); // B
+        assert!(find(&specs, "r2").unwrap().allowed_ips.contains(&"10.255.0.5/32".to_string())); // C
     }
 }

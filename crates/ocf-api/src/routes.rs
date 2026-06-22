@@ -295,7 +295,7 @@ async fn wireguard_status(State(c): Ctrl) -> Json<crate::fleet::WireguardView> {
 /// `GET /api/v1/fabric/routes` — the planned route from this node to every peer
 /// (direct vs relayed, weighed by measured RTT). The fabric's path selection.
 async fn fabric_routes(State(c): Ctrl) -> Json<Vec<crate::fleet::RouteView>> {
-    Json(c.routes_view())
+    Json(c.routes_view().await)
 }
 
 /// `POST /api/v1/fabric/machines/:id/heartbeat` — keep a node alive.

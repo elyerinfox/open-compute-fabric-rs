@@ -16,8 +16,7 @@ use std::collections::BTreeMap;
 
 use ocf_core::prelude::*;
 use ocf_fabric::{
-    plan_route, FabricNode, FabricServer, KeyPair, Liveness, MembershipEvent, NoiseTransport,
-    NodeId, Reachability, RoutePlan,
+    FabricServer, KeyPair, Liveness, MembershipEvent, NoiseTransport, NodeId, Reachability,
 };
 use ocf_loadbalancer::{Backend, LoadBalancer};
 use ocf_runtime::Workload;
@@ -87,30 +86,39 @@ impl FabricController {
         KeyPair::from_seed_name(&self.node_id)
     }
 
-    /// The planned route from this node to every other member: direct when the
-    /// peer is dialable, relayed (through the lowest-RTT relay) when it is
-    /// private, weighed by measured RTT. This is the fabric's "fastest path"
-    /// answer made observable.
-    pub fn routes_view(&self) -> Vec<RouteView> {
-        let self_id = self.node_keypair().node_id();
-        let members = self.membership.members();
-        let relays: Vec<FabricNode> = members
-            .iter()
-            .filter(|m| m.node.is_relay() && m.node.node_id != self_id)
-            .map(|m| m.node.clone())
-            .collect();
-        let relay_refs: Vec<&FabricNode> = relays.iter().collect();
-        members
-            .iter()
-            .filter(|m| m.node.node_id != self_id)
+    /// The planned route from this node to every other member, computed over the
+    /// fleet [`RouteGraph`](ocf_fabric::RouteGraph): `direct` when the peer can be
+    /// dialed/reverse-connected, `relayed` (through the per-destination next-hop
+    /// relay, with the full `hops` path) when it must bounce, or `unreachable`.
+    /// This is the graph's packet-forwarding decision, made observable.
+    pub async fn routes_view(&self) -> Vec<RouteView> {
+        let graph = self.route_graph().await;
+        let machines = self
+            .topology
+            .store()
+            .all_machines()
+            .await
+            .unwrap_or_default();
+        let name_of = |nid: &NodeId| {
+            machines
+                .iter()
+                .find(|m| KeyPair::from_seed_name(&m.metadata.name).node_id() == *nid)
+                .map(|m| m.metadata.name.clone())
+        };
+        let me = self.node_keypair().node_id();
+        self.membership
+            .members()
+            .into_iter()
+            .filter(|m| m.node.node_id != me)
             .map(|m| {
-                let plan = plan_route(&m.node, &relay_refs, |id| self.membership.rtt(id));
-                let (route, via, cost_ms) = match plan {
-                    RoutePlan::Direct { cost_ms, .. } => ("direct", None, Some(cost_ms)),
-                    RoutePlan::Relayed { relay, cost_ms, .. } => {
-                        ("relayed", Some(relay.to_string()), Some(cost_ms))
+                let dest = m.node.node_id.clone();
+                let (route, via, hops) = match graph.path(&me, &dest) {
+                    None => ("unreachable", None, Vec::new()),
+                    Some(h) if h.len() <= 1 => ("direct", None, Vec::new()),
+                    Some(h) => {
+                        let names: Vec<String> = h.iter().filter_map(&name_of).collect();
+                        ("relayed", name_of(&h[0]), names)
                     }
-                    RoutePlan::Unreachable => ("unreachable", None, None),
                 };
                 RouteView {
                     target: m.node.node_id.to_string(),
@@ -118,7 +126,7 @@ impl FabricController {
                     reachability: reachability_str(m.node.reachability).into(),
                     route: route.into(),
                     via,
-                    cost_ms,
+                    hops,
                 }
             })
             .collect()
@@ -188,17 +196,30 @@ impl FabricController {
             .collect()
     }
 
-    /// Run the fabric **control channel**: a ping server that echoes, plus a
-    /// prober that periodically times a round-trip to every alive peer and
-    /// records the **measured RTT** in membership. This is the real latency view
-    /// the load balancer's `Latency` policy and weighted routing consume. Spawn
-    /// on a task. On a single-host deployment peers are unreachable, so RTT stays
-    /// `None` — the mechanism is the same on a real fleet.
+    /// Run the fabric **control channel**: a control server that answers `ping`
+    /// (for RTT timing) and `latency` (returns this node's measured latency map),
+    /// plus a prober that periodically (1) times a round-trip to every alive peer
+    /// and records the **measured RTT** in membership, and (2) fetches each peer's
+    /// latency map so this node can build a fleet-wide [`RouteGraph`](ocf_fabric::RouteGraph)
+    /// for graph-aware routing. Spawn on a task. On a single-host deployment peers
+    /// are unreachable, so the maps stay empty — the mechanism is the same on a
+    /// real fleet.
     pub async fn run_latency_services(self: Arc<Self>) {
         let port = self.config.fabric_control_port;
+        let membership = self.membership.clone();
         match FabricServer::bind(("0.0.0.0", port), self.node_keypair()).await {
             Ok(srv) => {
-                tokio::spawn(srv.run(|_pk, req| async move { req }));
+                tokio::spawn(srv.run(move |_pk, req| {
+                    let membership = membership.clone();
+                    async move {
+                        if req == b"latency" {
+                            // Share our measured latencies so peers can build the graph.
+                            serde_json::to_vec(&membership.latency_snapshot()).unwrap_or_default()
+                        } else {
+                            req // `ping` → echo (for RTT timing)
+                        }
+                    }
+                }));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "fabric control server bind failed; latency probing off");
@@ -219,6 +240,16 @@ impl FabricController {
                 if client.request(&member.node, b"ping").await.is_ok() {
                     let rtt = t.elapsed().as_secs_f64() * 1000.0;
                     self.membership.record_rtt(&member.node.node_id, rtt);
+                }
+                // Pull the peer's own latency map to feed the fleet routing graph.
+                if let Ok(bytes) = client.request(&member.node, b"latency").await {
+                    if let Ok(map) =
+                        serde_json::from_slice::<std::collections::BTreeMap<String, f64>>(&bytes)
+                    {
+                        self.peer_latency
+                            .write()
+                            .insert(member.node.node_id.clone(), map);
+                    }
                 }
             }
         }
@@ -445,10 +476,10 @@ pub struct RouteView {
     pub reachability: String,
     /// `"direct"`, `"relayed"`, or `"unreachable"`.
     pub route: String,
-    /// The relay's node id when `route == "relayed"`.
+    /// The next-hop relay's name when `route == "relayed"`.
     pub via: Option<String>,
-    /// Estimated path cost in ms (`None` when unreachable).
-    pub cost_ms: Option<f64>,
+    /// The full path (machine names from this node to the target) when relayed.
+    pub hops: Vec<String>,
 }
 
 /// A lightweight view of one member for the API.

@@ -194,6 +194,16 @@ impl Membership {
         self.members.read().get(id).and_then(|m| m.rtt_ms)
     }
 
+    /// This node's measured latencies as `node_id -> rtt_ms`, for sharing with
+    /// peers so they can build a fleet-wide routing graph.
+    pub fn latency_snapshot(&self) -> std::collections::BTreeMap<String, f64> {
+        self.members
+            .read()
+            .values()
+            .filter_map(|m| m.rtt_ms.map(|r| (m.node.node_id.to_string(), r)))
+            .collect()
+    }
+
     /// Gracefully mark `id` as having left the fleet.
     pub fn leave(&self, id: &NodeId) -> Result<MembershipEvent> {
         let mut members = self.members.write();

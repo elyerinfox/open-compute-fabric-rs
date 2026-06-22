@@ -555,16 +555,19 @@ through a relay**, completing the any-to-any mesh:
 - A **relay node enables IP forwarding** on boot (`enable_ip_forwarding`) — without
   it the kernel would drop the bounced packet. (The health system also surfaces
   `ip_forward` state.)
-- The relay is chosen by `pick_relay`: the **lowest-RTT alive** relay (using the
-  measured [latency map](ocf-fabric.md#topology-intelligence-latency-reachability--routing)).
-  WireGuard is re-programmed on any membership change, so a private node **fails
-  over** to another live relay if its relay dies, and picks up a newly-joined one.
+- The next-hop relay is chosen **per destination** by the
+  [`RouteGraph`](ocf-fabric.md#topology-intelligence-latency-reachability--routing):
+  the shortest `self → relay → dest` path over gossiped RTTs, so **different peers
+  can route through different relays** (and multi-hop chains are handled). Each
+  private node holds tunnels to *all* relays, so WireGuard is re-programmed on any
+  membership change and a private node **fails over** to another relay when one
+  dies (and picks up newly-joined ones).
 
 The invariant: **given at least one reachable relay, every pair of nodes can
 talk** — public↔public direct, private↔public/relay by reverse-connect, and
-private↔private bounced through the relay. (A node that is `private` with *no*
-relay available logs a warning; designating ≥ 1 `public`/`relay` node is the
-requirement. Multi-hop relay chains for partitioned relays are a future refinement.)
+private↔private bounced through the graph's chosen relay. (A node that is
+`private` with *no* relay path logs a warning; designating ≥ 1 `public`/`relay`
+node is the requirement.)
 
 When a workload attaches to a subnet (`POST /api/v1/workloads/:id/network`), the
 controller resolves the container's host PID

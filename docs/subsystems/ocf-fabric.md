@@ -339,11 +339,13 @@ cargo run -p ocf-fabric --release --example fabric_bench
 The mesh is a flat full-mesh between *directly-dialable* nodes, but it is not
 blind to topology:
 
-**Measured latency.** Each node runs a control channel — a ping server plus a
-prober that periodically times a round-trip to every alive peer and records the
-result as `MemberState.rtt_ms`. This is a *real measured* RTT (not a static
-field), surfaced at `GET /api/v1/fabric/membership` and consumed by latency-aware
-routing and the load balancer's `Latency` policy.
+**Measured latency.** Each node runs a control channel — a server answering
+`ping` (RTT timing) and `latency` (its measured map), plus a prober that
+periodically times a round-trip to every alive peer (recorded as
+`MemberState.rtt_ms`) **and fetches each peer's latency map** so the node can
+assemble a fleet-wide RTT view. This is *real measured* RTT (not a static field),
+surfaced at `GET /api/v1/fabric/membership`, gossiped peer-to-peer, and fed into
+the routing graph and the load balancer's `Latency` policy.
 
 **Reachability.** A [`FabricNode`] carries a `Reachability`:
 
@@ -353,27 +355,28 @@ routing and the load balancer's `Latency` policy.
 | `Private` | Behind NAT / no inbound — **not** directly dialable; reached via a relay. |
 | `Relay` | Public *and* willing to forward traffic for `Private` peers. |
 
-**Weighted path selection.** `plan_route` (`routing.rs`) chooses how to reach a
-target, weighed by measured RTT:
+**Graph-aware path selection.** `RouteGraph` (`routing.rs`) models the fabric as a
+weighted graph — nodes carry their `Reachability`, an edge exists between any pair
+that can directly WireGuard-peer (**not both private**), and edge weight is the
+measured RTT (or `DEFAULT_EDGE_MS` until known). Dijkstra finds the shortest path
+between any two nodes, and `next_relay(src, dst)` returns the **next-hop relay** —
+the first node on a multi-hop path, or `None` when the destination is direct.
 
 ```mermaid
 flowchart TD
-    A[plan_route to target] --> B{target directly dialable?}
-    B -->|Public / Relay| C[Direct: cost = RTT of target]
-    B -->|Private| D{any relay?}
-    D -->|yes| E[Relayed via lowest-RTT relay:<br/>cost = RTT of relay + penalty]
-    D -->|no| F[Unreachable]
-    C --> G{relay strictly cheaper?}
-    E --> G
-    G -->|no| C
-    G -->|yes| E
+    A[RouteGraph.path&#40;self, dst&#41;] --> B{edge self–dst?<br/>&#40;not both private&#41;}
+    B -->|yes| C[Direct &#40;1 hop&#41;]
+    B -->|no| D[Dijkstra over relays:<br/>min cost self → relay → … → dst]
+    D --> E{any path?}
+    E -->|yes| F[next_relay = first hop]
+    E -->|no| G[Unreachable]
 ```
 
-A direct path wins ties and is only beaten by a *strictly cheaper* relay, so a
-reachable peer is never relayed needlessly. For a `Private` peer the planner
-picks the **lowest-RTT relay** — that is the "fastest path" calculation, made
-meaningful precisely where it matters (NAT'd nodes and multi-route choices).
-`GET /api/v1/fabric/routes` shows the plan from this node to every peer.
+Because the cost is the *whole* `self → relay → dst` sum (using a fleet-wide RTT
+view the nodes gossip — see Latency below), **different destinations can pick
+different relays**, and multi-hop relay chains fall out naturally. This is the
+fabric's packet-forwarding decision; `GET /api/v1/fabric/routes` shows the path
+(and next hop) from this node to every peer.
 
 **Relay datapath.** `NoiseTransport::request_via_relay(relay, target, payload)`
 forwards a request to a `Private` target through a relay; the relay runs
